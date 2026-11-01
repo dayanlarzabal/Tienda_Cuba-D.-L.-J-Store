@@ -7991,12 +7991,15 @@ else:
     s = s.replace('</manifest>', '    <queries>' + intents + '\n    </queries>\n</manifest>', 1)
 open(p, 'w', encoding='utf-8').write(s)
 
-# --- Fondo de arranque azul marino ---
+# --- Fondo de arranque azul marino (color como recurso, la forma segura para aapt2) ---
+os.makedirs('android/app/src/main/res/values', exist_ok=True)
+open('android/app/src/main/res/values/dlj_colors.xml', 'w', encoding='utf-8').write(
+    '<?xml version="1.0" encoding="utf-8"?>\n<resources>\n    <color name="dlj_navy">#061C41</color>\n</resources>\n')
 for d in ('drawable', 'drawable-v21'):
     f = 'android/app/src/main/res/%s/launch_background.xml' % d
     if os.path.exists(f):
         t = open(f, encoding='utf-8').read()
-        t = t.replace('@android:color/white', '#061C41').replace('?android:colorBackground', '#061C41')
+        t = t.replace('@android:color/white', '@color/dlj_navy').replace('?android:colorBackground', '@color/dlj_navy')
         open(f, 'w', encoding='utf-8').write(t)
 
 # --- Íconos del launcher a partir del logo ---
