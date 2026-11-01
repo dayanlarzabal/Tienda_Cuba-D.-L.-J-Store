@@ -1,12 +1,357 @@
 #!/usr/bin/env bash
 # HANDMADE D.L.J STORE — genera el proyecto Flutter completo y lo prepara para compilar el APK.
 # Se ejecuta desde el workflow de GitHub (build-apk.yml) en la raíz del repositorio.
+
+# ===== DATOS DE TU SERVIDOR (Supabase) =====
+# Se leen de las variables del repositorio (SUPABASE_URL y SUPABASE_ANON_KEY).
+# Si están vacías, la app funciona en modo local (sin servidor).
+SUPABASE_URL="${SUPABASE_URL:-}"
+SUPABASE_ANON_KEY="${SUPABASE_ANON_KEY:-}"
+# =============================================
+
 set -euo pipefail
+
+SUPABASE_URL="$(echo "${SUPABASE_URL}" | tr -d ' \r\n"')"
+SUPABASE_URL="${SUPABASE_URL%/}"
+SUPABASE_ANON_KEY="$(echo "${SUPABASE_ANON_KEY}" | tr -d ' \r\n"')"
+if [ -n "${SUPABASE_URL}${SUPABASE_ANON_KEY}" ]; then
+  case "${SUPABASE_URL}" in https://*) ;; *) echo "ERROR: SUPABASE_URL debe empezar por https://"; exit 1;; esac
+  case "${SUPABASE_ANON_KEY}" in eyJ*|sb_publishable_*) ;; *) echo "ERROR: SUPABASE_ANON_KEY no parece una clave anon/publishable válida"; exit 1;; esac
+  echo "▶ Modo servidor activado: ${SUPABASE_URL}"
+else
+  echo "▶ Modo local (sin servidor)"
+fi
 
 echo "▶ Creando archivos del proyecto…"
 rm -rf lib android
-mkdir -p lib/theme lib/models lib/state lib/utils lib/widgets lib/screens assets/images
-cat > 'lib/main.dart' <<'DLJ_EOF_1'
+mkdir -p lib/theme lib/models lib/state lib/utils lib/widgets lib/screens lib/data assets/images
+
+cat > lib/config.dart <<DLJ_CFG
+// Generado por proyecto.sh con los datos de tu servidor.
+const String kSupabaseUrl = '${SUPABASE_URL}';
+const String kSupabaseAnonKey = '${SUPABASE_ANON_KEY}';
+
+bool get kRemote => kSupabaseUrl.isNotEmpty && kSupabaseAnonKey.isNotEmpty;
+DLJ_CFG
+cat > 'lib/data/api.dart' <<'DLJ_EOF_1'
+import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
+
+import 'package:http/http.dart' as http;
+
+import '../config.dart';
+import '../models/models.dart';
+
+class ApiException implements Exception {
+  final String message;
+  ApiException(this.message);
+  @override
+  String toString() => message;
+}
+
+double _d(dynamic v) => v == null ? 0 : (double.tryParse(v.toString()) ?? 0);
+String _s(dynamic v) => v == null ? '' : v.toString();
+
+Product productFromRow(Map<String, dynamic> m) => Product(
+      id: _s(m['id']),
+      name: _s(m['name']),
+      subtitle: _s(m['subtitle']),
+      description: _s(m['description']),
+      kind: ProductKind.values.firstWhere(
+        (e) => e.name == m['kind'],
+        orElse: () => ProductKind.app,
+      ),
+      priceCUP: _d(m['price_cup']),
+      priceMLC: _d(m['price_mlc']),
+      priceUSDT: _d(m['price_usdt']),
+      imageUrl: _s(m['image_url']),
+      downloadUrl: _s(m['download_url']),
+      isDigital: m['is_digital'] == null ? true : m['is_digital'] == true,
+      badge: _s(m['badge']),
+      featured: m['featured'] == true,
+      active: m['active'] == null ? true : m['active'] == true,
+    );
+
+OrderRecord orderFromRow(Map<String, dynamic> m, {String token = ''}) {
+  final items = (m['items'] as List? ?? [])
+      .map((e) => Map<String, dynamic>.from(e as Map))
+      .map((i) => OrderLine(
+            productId: _s(i['product_id']),
+            name: _s(i['name']),
+            kind: ProductKind.values.firstWhere(
+              (e) => e.name == i['kind'],
+              orElse: () => ProductKind.app,
+            ),
+            qty: (_d(i['qty'])).toInt(),
+            unitCUP: _d(i['unit_cup']),
+            unitMLC: _d(i['unit_mlc']),
+            unitUSDT: _d(i['unit_usdt']),
+            isDigital: i['is_digital'] == null ? true : i['is_digital'] == true,
+            downloadUrl: _s(i['download_url']),
+          ))
+      .toList();
+  return OrderRecord(
+    id: _s(m['id']),
+    code: _s(m['code']),
+    accessToken: token,
+    lines: items,
+    method: PayMethod.values.firstWhere(
+      (e) => e.name == m['method'],
+      orElse: () => PayMethod.transfermovilCup,
+    ),
+    amount: _d(m['amount']),
+    reference: _s(m['reference']),
+    customerName: _s(m['customer_name']),
+    phone: _s(m['phone']),
+    address: _s(m['address']),
+    fromWallet: _s(m['from_wallet']),
+    createdAt: DateTime.tryParse(_s(m['created_at']))?.toLocal() ?? DateTime.now(),
+    status: OrderStatus.values.firstWhere(
+      (e) => e.name == m['status'],
+      orElse: () => OrderStatus.pending,
+    ),
+    sellerNote: _s(m['seller_note']),
+  );
+}
+
+/// Cliente del servidor (Supabase: PostgREST + Auth + Storage).
+class Api {
+  final http.Client _c = http.Client();
+  String? _access;
+  String? _refresh;
+
+  static const _timeout = Duration(seconds: 25);
+
+  bool get isAdmin => _access != null;
+
+  Map<String, String> _headers({bool json = true}) => {
+        'apikey': kSupabaseAnonKey,
+        if (_access != null) 'Authorization': 'Bearer $_access',
+        if (json) 'Content-Type': 'application/json',
+      };
+
+  Uri _u(String path, [Map<String, String>? query]) =>
+      Uri.parse('$kSupabaseUrl$path').replace(queryParameters: query);
+
+  String _errorMessage(http.Response r) {
+    var msg = 'Error del servidor (${r.statusCode})';
+    try {
+      final j = jsonDecode(utf8.decode(r.bodyBytes));
+      if (j is Map) {
+        final m = j['message'] ?? j['msg'] ?? j['error_description'] ?? j['error'];
+        if (m != null && m.toString().isNotEmpty) msg = m.toString();
+      }
+    } catch (_) {}
+    return msg;
+  }
+
+  Future<http.Response> _guard(Future<http.Response> Function() call) async {
+    try {
+      return await call().timeout(_timeout);
+    } on TimeoutException {
+      throw ApiException('El servidor tarda demasiado. Revisa tu conexión e inténtalo de nuevo.');
+    } on SocketException {
+      throw ApiException('Sin conexión. Revisa tu internet e inténtalo de nuevo.');
+    } on http.ClientException {
+      throw ApiException('Sin conexión. Revisa tu internet e inténtalo de nuevo.');
+    }
+  }
+
+  Future<dynamic> _send(Future<http.Response> Function() call, {bool retry = true}) async {
+    final r = await _guard(call);
+    if (r.statusCode == 401 && retry && _refresh != null) {
+      await _refreshSession();
+      return _send(call, retry: false);
+    }
+    if (r.statusCode >= 200 && r.statusCode < 300) {
+      if (r.bodyBytes.isEmpty) return null;
+      return jsonDecode(utf8.decode(r.bodyBytes));
+    }
+    throw ApiException(_errorMessage(r));
+  }
+
+  Future<dynamic> _rpc(String name, [Map<String, dynamic>? args]) => _send(
+        () => _c.post(_u('/rest/v1/rpc/$name'),
+            headers: _headers(), body: jsonEncode(args ?? <String, dynamic>{})),
+      );
+
+  // ─────────── Público ───────────
+
+  Future<List<Product>> fetchProducts() async {
+    final j = await _send(() => _c.get(
+          _u('/rest/v1/products', {
+            'select': '*',
+            'active': 'eq.true',
+            'order': 'sort.asc,created_at.desc',
+          }),
+          headers: _headers(json: false),
+        ));
+    return (j as List).map((e) => productFromRow(Map<String, dynamic>.from(e as Map))).toList();
+  }
+
+  Future<StoreConfig> fetchSettings() async {
+    final j = await _send(() => _c.get(
+          _u('/rest/v1/store_settings', {'select': '*', 'id': 'eq.1'}),
+          headers: _headers(json: false),
+        ));
+    final list = j as List;
+    if (list.isEmpty) return StoreConfig();
+    final m = Map<String, dynamic>.from(list.first as Map);
+    return StoreConfig(
+      businessName: _s(m['business_name']).isEmpty ? 'HANDMADE D.L.J STORE' : _s(m['business_name']),
+      whatsapp: _s(m['whatsapp']),
+      cupCard: _s(m['cup_card']),
+      mlcCard: _s(m['mlc_card']),
+      tronAddress: _s(m['tron_address']),
+      trxPerUsdt: _d(m['trx_per_usdt']),
+    );
+  }
+
+  Future<Map<String, dynamic>> createOrder({
+    required List<CartItem> cart,
+    required PayMethod method,
+    required String reference,
+    required String name,
+    required String phone,
+    required String address,
+    required String wallet,
+  }) async {
+    final j = await _rpc('create_order', {
+      'p_lines': [
+        for (final c in cart) {'product_id': c.product.id, 'qty': c.qty}
+      ],
+      'p_method': method.name,
+      'p_reference': reference,
+      'p_name': name,
+      'p_phone': phone,
+      'p_address': address,
+      'p_wallet': wallet,
+    });
+    return Map<String, dynamic>.from(j as Map);
+  }
+
+  Future<List<Map<String, dynamic>>> myOrders(List<String> tokens) async {
+    final j = await _rpc('my_orders', {'p_tokens': tokens});
+    return (j as List).map((e) => Map<String, dynamic>.from(e as Map)).toList();
+  }
+
+  // ─────────── Sesión del vendedor ───────────
+
+  Future<void> login(String email, String password) async {
+    final r = await _guard(() => _c.post(
+          Uri.parse('$kSupabaseUrl/auth/v1/token?grant_type=password'),
+          headers: {'apikey': kSupabaseAnonKey, 'Content-Type': 'application/json'},
+          body: jsonEncode({'email': email.trim(), 'password': password}),
+        ));
+    if (r.statusCode != 200) {
+      final msg = _errorMessage(r);
+      if (msg.toLowerCase().contains('invalid')) {
+        throw ApiException('Correo o contraseña incorrectos');
+      }
+      throw ApiException(msg);
+    }
+    final j = jsonDecode(utf8.decode(r.bodyBytes)) as Map<String, dynamic>;
+    _access = j['access_token'] as String?;
+    _refresh = j['refresh_token'] as String?;
+  }
+
+  Future<void> _refreshSession() async {
+    final token = _refresh;
+    if (token == null) return;
+    final r = await _guard(() => _c.post(
+          Uri.parse('$kSupabaseUrl/auth/v1/token?grant_type=refresh_token'),
+          headers: {'apikey': kSupabaseAnonKey, 'Content-Type': 'application/json'},
+          body: jsonEncode({'refresh_token': token}),
+        ));
+    if (r.statusCode != 200) {
+      logout();
+      throw ApiException('Tu sesión caducó. Vuelve a entrar.');
+    }
+    final j = jsonDecode(utf8.decode(r.bodyBytes)) as Map<String, dynamic>;
+    _access = j['access_token'] as String?;
+    _refresh = j['refresh_token'] as String?;
+  }
+
+  void logout() {
+    _access = null;
+    _refresh = null;
+  }
+
+  // ─────────── Vendedor ───────────
+
+  Future<List<OrderRecord>> adminOrders() async {
+    final j = await _rpc('admin_orders');
+    return (j as List)
+        .map((e) => orderFromRow(Map<String, dynamic>.from(e as Map)))
+        .toList();
+  }
+
+  Future<void> adminSetStatus(String id, OrderStatus status, String note) =>
+      _rpc('admin_set_order_status', {'p_id': id, 'p_status': status.name, 'p_note': note});
+
+  Future<List<Product>> adminProducts() async {
+    final j = await _rpc('admin_list_products');
+    return (j as List).map((e) => productFromRow(Map<String, dynamic>.from(e as Map))).toList();
+  }
+
+  Future<void> adminSaveProduct(Product p) async {
+    final isUuid = RegExp(r'^[0-9a-fA-F-]{36}$').hasMatch(p.id);
+    await _rpc('admin_save_product', {
+      'p': {
+        'id': isUuid ? p.id : null,
+        'name': p.name,
+        'subtitle': p.subtitle,
+        'description': p.description,
+        'kind': p.kind.name,
+        'price_cup': p.priceCUP,
+        'price_mlc': p.priceMLC,
+        'price_usdt': p.priceUSDT,
+        'image_url': p.imageUrl,
+        'download_url': p.downloadUrl,
+        'is_digital': p.isDigital,
+        'badge': p.badge,
+        'featured': p.featured,
+        'active': p.active,
+      }
+    });
+  }
+
+  Future<void> adminDeleteProduct(String id) => _rpc('admin_delete_product', {'p_id': id});
+
+  Future<void> adminSaveSettings(StoreConfig c) => _rpc('admin_save_settings', {
+        'p': {
+          'business_name': c.businessName,
+          'whatsapp': c.whatsapp,
+          'cup_card': c.cupCard,
+          'mlc_card': c.mlcCard,
+          'tron_address': c.tronAddress,
+          'trx_per_usdt': c.trxPerUsdt,
+        }
+      });
+
+  /// Sube una foto al almacenamiento del servidor y devuelve su URL pública.
+  Future<String> uploadImage(File file) async {
+    final bytes = await file.readAsBytes();
+    final lower = file.path.toLowerCase();
+    final ext = lower.endsWith('.png') ? 'png' : (lower.endsWith('.webp') ? 'webp' : 'jpg');
+    final mime = ext == 'png' ? 'image/png' : (ext == 'webp' ? 'image/webp' : 'image/jpeg');
+    final name = 'p_${DateTime.now().millisecondsSinceEpoch}.$ext';
+    await _send(() => _c.post(
+          _u('/storage/v1/object/product-images/$name'),
+          headers: {
+            'apikey': kSupabaseAnonKey,
+            if (_access != null) 'Authorization': 'Bearer $_access',
+            'Content-Type': mime,
+            'x-upsert': 'true',
+          },
+          body: bytes,
+        ));
+    return '$kSupabaseUrl/storage/v1/object/public/product-images/$name';
+  }
+}
+DLJ_EOF_1
+cat > 'lib/main.dart' <<'DLJ_EOF_2'
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
@@ -115,8 +460,8 @@ class _Splash extends StatelessWidget {
     );
   }
 }
-DLJ_EOF_1
-cat > 'lib/models/models.dart' <<'DLJ_EOF_2'
+DLJ_EOF_2
+cat > 'lib/models/models.dart' <<'DLJ_EOF_3'
 import 'package:flutter/material.dart';
 
 import '../theme/app_theme.dart';
@@ -193,6 +538,7 @@ class Product {
   final bool isDigital;
   final String badge;
   final bool featured;
+  final bool active;
 
   const Product({
     required this.id,
@@ -209,6 +555,7 @@ class Product {
     required this.isDigital,
     this.badge = '',
     this.featured = false,
+    this.active = true,
   });
 
   double priceIn(Cur c) => switch (c) {
@@ -232,6 +579,7 @@ class Product {
         'isDigital': isDigital,
         'badge': badge,
         'featured': featured,
+        'active': active,
       };
 
   factory Product.fromJson(Map<String, dynamic> j) => Product(
@@ -252,6 +600,7 @@ class Product {
         isDigital: (j['isDigital'] as bool?) ?? true,
         badge: (j['badge'] as String?) ?? '',
         featured: (j['featured'] as bool?) ?? false,
+        active: (j['active'] as bool?) ?? true,
       );
 }
 
@@ -448,6 +797,7 @@ class OrderLine {
 class OrderRecord {
   final String id;
   final String code;
+  final String accessToken; // clave secreta del pedido (modo servidor)
   final List<OrderLine> lines;
   final PayMethod method;
   final double amount; // monto en la moneda del método de pago
@@ -463,6 +813,7 @@ class OrderRecord {
   OrderRecord({
     required this.id,
     required this.code,
+    this.accessToken = '',
     required this.lines,
     required this.method,
     required this.amount,
@@ -483,6 +834,7 @@ class OrderRecord {
   Map<String, dynamic> toJson() => {
         'id': id,
         'code': code,
+        'accessToken': accessToken,
         'lines': lines.map((e) => e.toJson()).toList(),
         'method': method.name,
         'amount': amount,
@@ -499,6 +851,7 @@ class OrderRecord {
   factory OrderRecord.fromJson(Map<String, dynamic> j) => OrderRecord(
         id: j['id'] as String,
         code: (j['code'] as String?) ?? (j['id'] as String),
+        accessToken: (j['accessToken'] as String?) ?? '',
         lines: ((j['lines'] as List?) ?? [])
             .map((e) => OrderLine.fromJson(e as Map<String, dynamic>))
             .toList(),
@@ -520,8 +873,8 @@ class OrderRecord {
         sellerNote: (j['sellerNote'] as String?) ?? '',
       );
 }
-DLJ_EOF_2
-cat > 'lib/screens/account_page.dart' <<'DLJ_EOF_3'
+DLJ_EOF_3
+cat > 'lib/screens/account_page.dart' <<'DLJ_EOF_4'
 import 'package:flutter/material.dart';
 
 import '../state/app_store.dart';
@@ -591,25 +944,32 @@ class AccountPage extends StatelessWidget {
           icon: Icons.payments_rounded,
           title: 'Moneda de los precios',
           subtitle: 'Se aplica en toda la tienda',
-          trailing: CurrencySwitch(value: store.currency, onChanged: store.setCurrency),
+          below: CurrencySwitch(value: store.currency, onChanged: store.setCurrency),
         ),
-        const SectionTitle('Negocio'),
-        _Tile(
-          icon: Icons.admin_panel_settings_rounded,
-          title: 'Panel del vendedor',
-          subtitle: store.pendingCount > 0
-              ? '${store.pendingCount} pedido(s) por verificar'
-              : 'Catálogo, pedidos, pagos y ajustes',
-          trailing: store.pendingCount > 0
-              ? Badge(label: Text('${store.pendingCount}'))
-              : const Icon(Icons.chevron_right_rounded),
-          onTap: () => Navigator.of(context).push(MaterialPageRoute(builder: (_) => const SellerGate())),
-        ),
+        if (store.sellerEntryVisible) ...[
+          const SectionTitle('Negocio'),
+          _Tile(
+            icon: Icons.admin_panel_settings_rounded,
+            title: 'Panel del vendedor',
+            subtitle: store.pendingCount > 0
+                ? '${store.pendingCount} pedido(s) por verificar'
+                : 'Catálogo, pedidos, pagos y ajustes',
+            trailing: store.pendingCount > 0
+                ? Badge(label: Text('${store.pendingCount}'))
+                : const Icon(Icons.chevron_right_rounded),
+            onTap: () => Navigator.of(context).push(MaterialPageRoute(builder: (_) => const SellerGate())),
+          ),
+        ],
         const SectionTitle('Información'),
-        const _Tile(
+        _Tile(
           icon: Icons.info_rounded,
           title: 'HANDMADE D.L.J STORE',
-          subtitle: 'Versión 2.0 · Apps, juegos, arte, pintura, escultura y artesanías',
+          subtitle: 'Versión 2.1 · Apps, juegos, arte, pintura, escultura y artesanías',
+          trailing: const SizedBox.shrink(),
+          onTap: () async {
+            final revealed = await store.aboutTap();
+            if (revealed && context.mounted) toast(context, 'Modo vendedor activado');
+          },
         ),
         const SizedBox(height: 30),
       ],
@@ -668,12 +1028,14 @@ class _Tile extends StatelessWidget {
   final String title;
   final String subtitle;
   final Widget? trailing;
+  final Widget? below;
   final VoidCallback? onTap;
   const _Tile({
     required this.icon,
     required this.title,
     required this.subtitle,
     this.trailing,
+    this.below,
     this.onTap,
   });
 
@@ -703,6 +1065,7 @@ class _Tile extends StatelessWidget {
                   Text(title, style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 15.5)),
                   const SizedBox(height: 2),
                   Text(subtitle, style: const TextStyle(color: Palette.muted, fontSize: 12.5, height: 1.3)),
+                  if (below != null) ...[const SizedBox(height: 10), below!],
                 ],
               ),
             ),
@@ -714,8 +1077,8 @@ class _Tile extends StatelessWidget {
     );
   }
 }
-DLJ_EOF_3
-cat > 'lib/screens/cart_page.dart' <<'DLJ_EOF_4'
+DLJ_EOF_4
+cat > 'lib/screens/cart_page.dart' <<'DLJ_EOF_5'
 import 'package:flutter/material.dart';
 
 import '../models/models.dart';
@@ -900,8 +1263,8 @@ class _Summary extends StatelessWidget {
     );
   }
 }
-DLJ_EOF_4
-cat > 'lib/screens/checkout_page.dart' <<'DLJ_EOF_5'
+DLJ_EOF_5
+cat > 'lib/screens/checkout_page.dart' <<'DLJ_EOF_6'
 import 'package:flutter/material.dart';
 
 import '../models/models.dart';
@@ -931,7 +1294,11 @@ class _CheckoutPageState extends State<CheckoutPage> {
     super.didChangeDependencies();
     if (_prefilled) return;
     _prefilled = true;
-    final prof = AppScope.of(context).profile;
+    final st = AppScope.of(context);
+    if (st.remote) {
+      WidgetsBinding.instance.addPostFrameCallback((_) => st.refreshRemote());
+    }
+    final prof = st.profile;
     name.text = prof.name;
     phone.text = prof.phone;
     address.text = prof.address;
@@ -1156,8 +1523,8 @@ class _MethodTile extends StatelessWidget {
     );
   }
 }
-DLJ_EOF_5
-cat > 'lib/screens/home_page.dart' <<'DLJ_EOF_6'
+DLJ_EOF_6
+cat > 'lib/screens/home_page.dart' <<'DLJ_EOF_7'
 import 'package:flutter/material.dart';
 
 import '../models/models.dart';
@@ -1191,7 +1558,11 @@ class _HomePageState extends State<HomePage> {
     final featured = store.products.where((p) => p.featured).toList();
     final showFeatured = q.isEmpty && kind == null && featured.isNotEmpty;
 
-    return CustomScrollView(
+    return RefreshIndicator(
+      color: Palette.coral,
+      onRefresh: store.refreshRemote,
+      child: CustomScrollView(
+      physics: const AlwaysScrollableScrollPhysics(),
       slivers: [
         SliverToBoxAdapter(child: _Header(
           store: store,
@@ -1224,13 +1595,26 @@ class _HomePageState extends State<HomePage> {
           child: SectionTitle(kind == null ? 'Todo el catálogo' : kind!.plural),
         ),
         if (filtered.isEmpty)
-          const SliverToBoxAdapter(
+          SliverToBoxAdapter(
             child: Padding(
-              padding: EdgeInsets.only(top: 30, bottom: 60),
+              padding: const EdgeInsets.only(top: 30, bottom: 60),
               child: EmptyState(
-                icon: Icons.search_off_rounded,
-                title: 'Sin resultados',
-                message: 'Prueba con otra palabra o elige otra categoría.',
+                icon: store.products.isEmpty ? Icons.cloud_off_rounded : Icons.search_off_rounded,
+                title: store.products.isEmpty
+                    ? (store.syncError != null ? 'No pudimos cargar la tienda' : 'Pronto habrá productos')
+                    : 'Sin resultados',
+                message: store.products.isEmpty
+                    ? (store.syncError ?? 'Estamos preparando el catálogo. Vuelve en un momento.')
+                    : 'Prueba con otra palabra o elige otra categoría.',
+                action: store.products.isEmpty && store.remote
+                    ? SizedBox(
+                        width: 200,
+                        child: OutlinedButton(
+                          onPressed: store.refreshRemote,
+                          child: const Text('Reintentar'),
+                        ),
+                      )
+                    : null,
               ),
             ),
           )
@@ -1251,6 +1635,7 @@ class _HomePageState extends State<HomePage> {
             ),
           ),
       ],
+    ),
     );
   }
 }
@@ -1532,8 +1917,8 @@ class ProductCard extends StatelessWidget {
     );
   }
 }
-DLJ_EOF_6
-cat > 'lib/screens/order_success_page.dart' <<'DLJ_EOF_7'
+DLJ_EOF_7
+cat > 'lib/screens/order_success_page.dart' <<'DLJ_EOF_8'
 import 'package:flutter/material.dart';
 
 import '../models/models.dart';
@@ -1648,12 +2033,13 @@ class OrderSuccessPage extends StatelessWidget {
     );
   }
 }
-DLJ_EOF_7
-cat > 'lib/screens/payment_crypto_page.dart' <<'DLJ_EOF_8'
+DLJ_EOF_8
+cat > 'lib/screens/payment_crypto_page.dart' <<'DLJ_EOF_9'
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:qr_flutter/qr_flutter.dart';
 
+import '../data/api.dart';
 import '../models/models.dart';
 import '../state/app_store.dart';
 import '../theme/app_theme.dart';
@@ -1702,19 +2088,25 @@ class _PaymentCryptoPageState extends State<PaymentCryptoPage> {
   Future<void> _submit(AppStore store) async {
     if (!_form.currentState!.validate()) return;
     setState(() => busy = true);
-    final order = await store.createOrder(
-      method: widget.method,
-      reference: txid.text,
-      name: widget.data.name,
-      phone: widget.data.phone,
-      address: widget.data.address,
-      fromWallet: store.profile.wallet,
-    );
-    if (!mounted) return;
-    Navigator.of(context).pushAndRemoveUntil(
-      MaterialPageRoute(builder: (_) => OrderSuccessPage(order: order)),
-      (r) => r.isFirst,
-    );
+    try {
+      final order = await store.createOrder(
+        method: widget.method,
+        reference: txid.text,
+        name: widget.data.name,
+        phone: widget.data.phone,
+        address: widget.data.address,
+        fromWallet: store.profile.wallet,
+      );
+      if (!mounted) return;
+      Navigator.of(context).pushAndRemoveUntil(
+        MaterialPageRoute(builder: (_) => OrderSuccessPage(order: order)),
+        (r) => r.isFirst,
+      );
+    } on ApiException catch (e) {
+      if (!mounted) return;
+      setState(() => busy = false);
+      toast(context, e.message);
+    }
   }
 
   @override
@@ -1931,10 +2323,11 @@ class _WalletBox extends StatelessWidget {
     );
   }
 }
-DLJ_EOF_8
-cat > 'lib/screens/payment_transfermovil_page.dart' <<'DLJ_EOF_9'
+DLJ_EOF_9
+cat > 'lib/screens/payment_transfermovil_page.dart' <<'DLJ_EOF_10'
 import 'package:flutter/material.dart';
 
+import '../data/api.dart';
 import '../models/models.dart';
 import '../state/app_store.dart';
 import '../theme/app_theme.dart';
@@ -1970,18 +2363,24 @@ class _PaymentTransfermovilPageState extends State<PaymentTransfermovilPage> {
       return;
     }
     setState(() => busy = true);
-    final order = await store.createOrder(
-      method: widget.method,
-      reference: ref.text,
-      name: widget.data.name,
-      phone: widget.data.phone,
-      address: widget.data.address,
-    );
-    if (!mounted) return;
-    Navigator.of(context).pushAndRemoveUntil(
-      MaterialPageRoute(builder: (_) => OrderSuccessPage(order: order)),
-      (r) => r.isFirst,
-    );
+    try {
+      final order = await store.createOrder(
+        method: widget.method,
+        reference: ref.text,
+        name: widget.data.name,
+        phone: widget.data.phone,
+        address: widget.data.address,
+      );
+      if (!mounted) return;
+      Navigator.of(context).pushAndRemoveUntil(
+        MaterialPageRoute(builder: (_) => OrderSuccessPage(order: order)),
+        (r) => r.isFirst,
+      );
+    } on ApiException catch (e) {
+      if (!mounted) return;
+      setState(() => busy = false);
+      toast(context, e.message);
+    }
   }
 
   @override
@@ -2197,8 +2596,8 @@ class _Step extends StatelessWidget {
     );
   }
 }
-DLJ_EOF_9
-cat > 'lib/screens/product_page.dart' <<'DLJ_EOF_10'
+DLJ_EOF_10
+cat > 'lib/screens/product_page.dart' <<'DLJ_EOF_11'
 import 'package:flutter/material.dart';
 
 import '../models/models.dart';
@@ -2397,8 +2796,8 @@ class _InfoTile extends StatelessWidget {
     );
   }
 }
-DLJ_EOF_10
-cat > 'lib/screens/purchases_page.dart' <<'DLJ_EOF_11'
+DLJ_EOF_11
+cat > 'lib/screens/purchases_page.dart' <<'DLJ_EOF_12'
 import 'package:flutter/material.dart';
 
 import '../models/models.dart';
@@ -2420,7 +2819,20 @@ class _PurchasesPageState extends State<PurchasesPage> {
   Widget build(BuildContext context) {
     final store = AppScope.of(context);
     return Scaffold(
-      appBar: AppBar(title: const Text('Mis compras')),
+      appBar: AppBar(
+        title: const Text('Mis compras'),
+        actions: [
+          if (store.remote)
+            IconButton(
+              tooltip: 'Actualizar',
+              icon: const Icon(Icons.refresh_rounded),
+              onPressed: () async {
+                await store.refreshOrders();
+                if (context.mounted) toast(context, 'Pedidos actualizados');
+              },
+            ),
+        ],
+      ),
       body: Column(
         children: [
           Padding(
@@ -2631,11 +3043,15 @@ class _Downloads extends StatelessWidget {
     );
   }
 }
-DLJ_EOF_11
-cat > 'lib/screens/seller_pages.dart' <<'DLJ_EOF_12'
+DLJ_EOF_12
+cat > 'lib/screens/seller_pages.dart' <<'DLJ_EOF_13'
+import 'dart:async';
+import 'dart:io';
+
 import 'package:flutter/material.dart';
 import 'package:image_picker/image_picker.dart';
 
+import '../data/api.dart';
 import '../models/models.dart';
 import '../state/app_store.dart';
 import '../theme/app_theme.dart';
@@ -2650,8 +3066,102 @@ class SellerGate extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final store = AppScope.of(context);
+    if (store.remote) {
+      return store.api.isAdmin ? const SellerDashboard() : const _LoginScreen();
+    }
     if (store.sellerUnlocked) return const SellerDashboard();
     return _PinScreen(creating: !store.hasPin);
+  }
+}
+
+/// Entrada del vendedor cuando la tienda usa servidor: correo y contraseña.
+class _LoginScreen extends StatefulWidget {
+  const _LoginScreen();
+  @override
+  State<_LoginScreen> createState() => _LoginScreenState();
+}
+
+class _LoginScreenState extends State<_LoginScreen> {
+  final email = TextEditingController();
+  final pass = TextEditingController();
+  String? error;
+  bool busy = false;
+  bool hide = true;
+
+  @override
+  void dispose() {
+    email.dispose();
+    pass.dispose();
+    super.dispose();
+  }
+
+  Future<void> _login(AppStore store) async {
+    if (email.text.trim().isEmpty || pass.text.isEmpty) {
+      setState(() => error = 'Escribe tu correo y tu contraseña');
+      return;
+    }
+    setState(() {
+      busy = true;
+      error = null;
+    });
+    try {
+      await store.sellerLogin(email.text, pass.text);
+    } on ApiException catch (e) {
+      if (mounted) setState(() => error = e.message);
+    }
+    if (mounted) setState(() => busy = false);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final store = AppScope.of(context);
+    return Scaffold(
+      appBar: AppBar(title: const Text('Panel del vendedor')),
+      body: ListView(
+        padding: const EdgeInsets.fromLTRB(24, 20, 24, 30),
+        children: [
+          const Center(child: BrandLogo(size: 84)),
+          const SizedBox(height: 22),
+          const Text('Acceso de vendedor',
+              textAlign: TextAlign.center,
+              style: TextStyle(fontSize: 22, fontWeight: FontWeight.w800)),
+          const SizedBox(height: 6),
+          const Text('Entra con la cuenta que creaste en tu servidor.',
+              textAlign: TextAlign.center, style: TextStyle(color: Palette.muted, height: 1.4)),
+          const SizedBox(height: 26),
+          TextField(
+            controller: email,
+            keyboardType: TextInputType.emailAddress,
+            autocorrect: false,
+            decoration: fieldDec('Correo', icon: Icons.alternate_email_rounded),
+          ),
+          const SizedBox(height: 12),
+          TextField(
+            controller: pass,
+            obscureText: hide,
+            decoration: fieldDec('Contraseña', icon: Icons.lock_outline_rounded).copyWith(
+              suffixIcon: IconButton(
+                icon: Icon(hide ? Icons.visibility_rounded : Icons.visibility_off_rounded),
+                onPressed: () => setState(() => hide = !hide),
+              ),
+            ),
+            onSubmitted: (_) => _login(store),
+          ),
+          if (error != null) ...[
+            const SizedBox(height: 10),
+            Text(error!,
+                textAlign: TextAlign.center,
+                style: const TextStyle(color: Palette.danger, fontWeight: FontWeight.w700)),
+          ],
+          const SizedBox(height: 22),
+          CoralButton(
+            label: busy ? 'Entrando…' : 'Entrar',
+            icon: Icons.lock_open_rounded,
+            onPressed: busy ? null : () => _login(store),
+          ),
+        ],
+      ),
+    );
   }
 }
 
@@ -2767,8 +3277,33 @@ class _PinScreenState extends State<_PinScreen> {
 
 // ───────────────────────── Panel ─────────────────────────
 
-class SellerDashboard extends StatelessWidget {
+class SellerDashboard extends StatefulWidget {
   const SellerDashboard({super.key});
+  @override
+  State<SellerDashboard> createState() => _SellerDashboardState();
+}
+
+class _SellerDashboardState extends State<SellerDashboard> {
+  Timer? _timer;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      final store = AppScope.of(context);
+      if (!store.remote) return;
+      _timer = Timer.periodic(const Duration(seconds: 30), (_) {
+        if (mounted) AppScope.of(context).refreshSeller();
+      });
+    });
+  }
+
+  @override
+  void dispose() {
+    _timer?.cancel();
+    super.dispose();
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -2870,7 +3405,7 @@ class _OrdersTabState extends State<_OrdersTab> {
   @override
   Widget build(BuildContext context) {
     final store = AppScope.of(context);
-    final list = store.orders.where((o) => filter == null || o.status == filter).toList();
+    final list = store.sellerList.where((o) => filter == null || o.status == filter).toList();
 
     return Column(
       children: [
@@ -2891,18 +3426,29 @@ class _OrdersTabState extends State<_OrdersTab> {
           ),
         ),
         Expanded(
-          child: list.isEmpty
-              ? const EmptyState(
-                  icon: Icons.inbox_rounded,
-                  title: 'Sin pedidos',
-                  message: 'Los pedidos aparecerán aquí cuando un cliente confirme su pago.',
-                )
-              : ListView.separated(
-                  padding: const EdgeInsets.fromLTRB(20, 8, 20, 24),
-                  itemCount: list.length,
-                  separatorBuilder: (_, __) => const SizedBox(height: 12),
-                  itemBuilder: (_, i) => _SellerOrderCard(order: list[i], store: store),
-                ),
+          child: RefreshIndicator(
+            color: Palette.coral,
+            onRefresh: store.refreshSeller,
+            child: list.isEmpty
+                ? ListView(
+                    physics: const AlwaysScrollableScrollPhysics(),
+                    children: const [
+                      SizedBox(height: 40),
+                      EmptyState(
+                        icon: Icons.inbox_rounded,
+                        title: 'Sin pedidos',
+                        message: 'Los pedidos aparecerán aquí cuando un cliente confirme su pago.',
+                      ),
+                    ],
+                  )
+                : ListView.separated(
+                    physics: const AlwaysScrollableScrollPhysics(),
+                    padding: const EdgeInsets.fromLTRB(20, 8, 20, 24),
+                    itemCount: list.length,
+                    separatorBuilder: (_, __) => const SizedBox(height: 12),
+                    itemBuilder: (_, i) => _SellerOrderCard(order: list[i], store: store),
+                  ),
+          ),
         ),
       ],
     );
@@ -2939,6 +3485,15 @@ class _SellerOrderCard extends StatelessWidget {
   final AppStore store;
   const _SellerOrderCard({required this.order, required this.store});
 
+  Future<void> _set(BuildContext context, OrderStatus s, {String note = '', String? ok}) async {
+    try {
+      await store.setOrderStatus(order, s, note: note);
+      if (ok != null && context.mounted) toast(context, ok);
+    } on ApiException catch (e) {
+      if (context.mounted) toast(context, e.message);
+    }
+  }
+
   Future<void> _reject(BuildContext context) async {
     final note = TextEditingController();
     final ok = await showDialog<bool>(
@@ -2962,7 +3517,7 @@ class _SellerOrderCard extends StatelessWidget {
       ),
     );
     final text = note.text;
-    if (ok == true) await store.setOrderStatus(order, OrderStatus.rejected, note: text);
+    if (ok == true && context.mounted) await _set(context, OrderStatus.rejected, note: text);
   }
 
   @override
@@ -3039,10 +3594,8 @@ class _SellerOrderCard extends StatelessWidget {
                   child: FilledButton(
                     style: FilledButton.styleFrom(
                         backgroundColor: Palette.ok, minimumSize: const Size.fromHeight(48)),
-                    onPressed: () async {
-                      await store.setOrderStatus(o, OrderStatus.verified);
-                      if (context.mounted) toast(context, 'Pago verificado · descargas liberadas');
-                    },
+                    onPressed: () => _set(context, OrderStatus.verified,
+                        ok: 'Pago verificado · descargas liberadas'),
                     child: const Text('Verificar pago'),
                   ),
                 ),
@@ -3050,12 +3603,12 @@ class _SellerOrderCard extends StatelessWidget {
             ),
           if (o.status == OrderStatus.verified && o.hasPhysical)
             FilledButton(
-              onPressed: () => store.setOrderStatus(o, OrderStatus.delivered),
+              onPressed: () => _set(context, OrderStatus.delivered, ok: 'Marcado como entregado'),
               child: const Text('Marcar como entregado'),
             ),
           if (o.status == OrderStatus.rejected)
             OutlinedButton(
-              onPressed: () => store.setOrderStatus(o, OrderStatus.pending),
+              onPressed: () => _set(context, OrderStatus.pending),
               child: const Text('Reabrir para verificar'),
             ),
           if (wa.length >= 8) ...[
@@ -3090,13 +3643,13 @@ class _CatalogTab extends StatelessWidget {
               .push(MaterialPageRoute(builder: (_) => const ProductFormPage())),
         ),
         const SizedBox(height: 16),
-        if (store.products.isEmpty)
+        if ((store.remote ? store.adminProducts : store.products).isEmpty)
           const EmptyState(
             icon: Icons.inventory_2_outlined,
             title: 'Catálogo vacío',
             message: 'Añade tu primer producto para empezar a vender.',
           ),
-        for (final p in store.products)
+        for (final p in (store.remote ? store.adminProducts : store.products))
           Padding(
             padding: const EdgeInsets.only(bottom: 12),
             child: SoftCard(
@@ -3141,7 +3694,16 @@ class _CatalogTab extends StatelessWidget {
                           ],
                         ),
                       );
-                      if (ok == true) await store.deleteProduct(p.id);
+                      if (ok != true) return;
+                      try {
+                        if (store.remote) {
+                          await store.adminDeleteProduct(p.id);
+                        } else {
+                          await store.deleteProduct(p.id);
+                        }
+                      } on ApiException catch (e) {
+                        if (context.mounted) toast(context, e.message);
+                      }
                     },
                   ),
                 ],
@@ -3166,7 +3728,9 @@ class _ProductFormPageState extends State<ProductFormPage> {
   late ProductKind kind;
   late bool digital;
   late bool featured;
+  late bool active;
   String imagePath = '';
+  bool newImage = false;
   bool busy = false;
 
   @override
@@ -3185,6 +3749,7 @@ class _ProductFormPageState extends State<ProductFormPage> {
     kind = p?.kind ?? ProductKind.app;
     digital = p?.isDigital ?? true;
     featured = p?.featured ?? false;
+    active = p?.active ?? true;
     imagePath = p?.imagePath ?? '';
   }
 
@@ -3207,8 +3772,14 @@ class _ProductFormPageState extends State<ProductFormPage> {
     try {
       final x = await ImagePicker().pickImage(source: ImageSource.gallery, maxWidth: 1600, imageQuality: 85);
       if (x == null) return;
-      final saved = await store.persistImage(x.path);
-      if (mounted) setState(() => imagePath = saved);
+      // En modo servidor la foto se sube al guardar; en local se copia a la app.
+      final saved = store.remote ? x.path : await store.persistImage(x.path);
+      if (mounted) {
+        setState(() {
+          imagePath = saved;
+          newImage = true;
+        });
+      }
     } catch (_) {
       if (mounted) toast(context, 'No se pudo cargar la imagen');
     }
@@ -3217,8 +3788,19 @@ class _ProductFormPageState extends State<ProductFormPage> {
   Future<void> _save(AppStore store) async {
     if (!_form.currentState!.validate()) return;
     setState(() => busy = true);
+    var url = imageUrl.text.trim();
+    if (store.remote && newImage && imagePath.isNotEmpty) {
+      try {
+        url = await store.api.uploadImage(File(imagePath));
+      } on ApiException catch (e) {
+        if (!mounted) return;
+        setState(() => busy = false);
+        toast(context, 'No se pudo subir la foto: ${e.message}');
+        return;
+      }
+    }
     final p = Product(
-      id: widget.product?.id ?? DateTime.now().millisecondsSinceEpoch.toString(),
+      id: widget.product?.id ?? (store.remote ? '' : DateTime.now().millisecondsSinceEpoch.toString()),
       name: name.text.trim(),
       subtitle: subtitle.text.trim(),
       description: description.text.trim(),
@@ -3226,14 +3808,26 @@ class _ProductFormPageState extends State<ProductFormPage> {
       priceCUP: _num(cup),
       priceMLC: _num(mlc),
       priceUSDT: _num(usdt),
-      imageUrl: imageUrl.text.trim(),
-      imagePath: imagePath,
+      imageUrl: url,
+      imagePath: store.remote ? '' : imagePath,
       downloadUrl: digital ? download.text.trim() : '',
       isDigital: digital,
       badge: badge.text.trim(),
       featured: featured,
+      active: active,
     );
-    await store.upsertProduct(p);
+    try {
+      if (store.remote) {
+        await store.adminSaveProduct(p);
+      } else {
+        await store.upsertProduct(p);
+      }
+    } on ApiException catch (e) {
+      if (!mounted) return;
+      setState(() => busy = false);
+      toast(context, e.message);
+      return;
+    }
     if (mounted) Navigator.of(context).pop();
   }
 
@@ -3374,6 +3968,13 @@ class _ProductFormPageState extends State<ProductFormPage> {
               onChanged: (v) => setState(() => featured = v),
               title: const Text('Mostrar en Destacados', style: TextStyle(fontWeight: FontWeight.w700)),
             ),
+            SwitchListTile(
+              contentPadding: EdgeInsets.zero,
+              value: active,
+              onChanged: (v) => setState(() => active = v),
+              title: const Text('Visible en la tienda', style: TextStyle(fontWeight: FontWeight.w700)),
+              subtitle: const Text('Apágalo para ocultarlo sin borrarlo'),
+            ),
             const SizedBox(height: 14),
             CoralButton(
               label: busy ? 'Guardando…' : 'Guardar producto',
@@ -3442,8 +4043,16 @@ class _SettingsTabState extends State<_SettingsTab> {
     c.mlcCard = onlyDigits(mlc.text);
     c.tronAddress = tron.text.trim();
     c.trxPerUsdt = double.tryParse(trx.text.trim().replaceAll(',', '.')) ?? 0;
-    await store.saveConfig();
-    if (mounted) toast(context, 'Ajustes de cobro guardados');
+    try {
+      if (store.remote) {
+        await store.adminSaveSettings();
+      } else {
+        await store.saveConfig();
+      }
+      if (mounted) toast(context, 'Ajustes de cobro guardados');
+    } on ApiException catch (e) {
+      if (mounted) toast(context, e.message);
+    }
   }
 
   Future<void> _changePin(AppStore store) async {
@@ -3563,19 +4172,21 @@ class _SettingsTabState extends State<_SettingsTab> {
           ),
           const SizedBox(height: 22),
           CoralButton(label: 'Guardar ajustes', icon: Icons.check_rounded, onPressed: () => _save(store)),
-          const SizedBox(height: 22),
-          OutlinedButton.icon(
-            onPressed: () => _changePin(store),
-            icon: const Icon(Icons.password_rounded, size: 18),
-            label: const Text('Cambiar PIN'),
-          ),
+          if (!store.remote) ...[
+            const SizedBox(height: 22),
+            OutlinedButton.icon(
+              onPressed: () => _changePin(store),
+              icon: const Icon(Icons.password_rounded, size: 18),
+              label: const Text('Cambiar PIN'),
+            ),
+          ],
         ],
       ),
     );
   }
 }
-DLJ_EOF_12
-cat > 'lib/screens/shell.dart' <<'DLJ_EOF_13'
+DLJ_EOF_13
+cat > 'lib/screens/shell.dart' <<'DLJ_EOF_14'
 import 'package:flutter/material.dart';
 
 import '../state/app_store.dart';
@@ -3643,8 +4254,8 @@ class _MainShellState extends State<MainShell> {
     );
   }
 }
-DLJ_EOF_13
-cat > 'lib/screens/wallet_page.dart' <<'DLJ_EOF_14'
+DLJ_EOF_14
+cat > 'lib/screens/wallet_page.dart' <<'DLJ_EOF_15'
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
@@ -3783,8 +4394,9 @@ class _WalletPageState extends State<WalletPage> {
     );
   }
 }
-DLJ_EOF_14
-cat > 'lib/state/app_store.dart' <<'DLJ_EOF_15'
+DLJ_EOF_15
+cat > 'lib/state/app_store.dart' <<'DLJ_EOF_16'
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
@@ -3793,6 +4405,8 @@ import 'package:flutter/material.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import '../config.dart';
+import '../data/api.dart';
 import '../models/models.dart';
 import '../utils/helpers.dart';
 
@@ -3889,6 +4503,17 @@ class AppStore extends ChangeNotifier {
   Cur currency = Cur.cup;
   bool loaded = false;
 
+  // Modo servidor (Supabase). Si no hay datos de servidor, todo es local.
+  final Api api = Api();
+  final bool remote = kRemote;
+  bool syncing = false;
+  String? syncError;
+  List<OrderRecord> sellerOrders = [];
+  List<Product> adminProducts = [];
+  bool _sellerVisible = !kRemote;
+  int _aboutTaps = 0;
+  Timer? _timer;
+
   // Sesión del vendedor (solo en memoria).
   bool sellerUnlocked = false;
   int _failedPin = 0;
@@ -3899,6 +4524,7 @@ class AppStore extends ChangeNotifier {
   static const _kProfile = 'djl2_profile';
   static const _kOrders = 'djl2_orders';
   static const _kCurrency = 'djl2_currency';
+  static const _kSellerVisible = 'djl2_seller_visible';
 
   // ─────────── Carga / guardado ───────────
 
@@ -3910,7 +4536,7 @@ class AppStore extends ChangeNotifier {
         products = (jsonDecode(raw) as List)
             .map((e) => Product.fromJson(e as Map<String, dynamic>))
             .toList();
-      } else {
+      } else if (!remote) {
         products = seedProducts();
         await _saveProducts();
       }
@@ -3926,12 +4552,154 @@ class AppStore extends ChangeNotifier {
       }
       final cur = p.getString(_kCurrency);
       currency = Cur.values.firstWhere((e) => e.name == cur, orElse: () => Cur.cup);
+      if (remote) _sellerVisible = p.getBool(_kSellerVisible) ?? false;
     } catch (_) {
       // Si algún dato guardado está dañado, arrancamos con el catálogo base.
-      if (products.isEmpty) products = seedProducts();
+      if (products.isEmpty && !remote) products = seedProducts();
     }
     loaded = true;
     notifyListeners();
+    if (remote) {
+      unawaited(refreshRemote());
+      unawaited(refreshOrders());
+      _timer = Timer.periodic(const Duration(seconds: 45), (_) {
+        if (orders.any((o) => o.status == OrderStatus.pending)) {
+          unawaited(refreshOrders());
+        }
+      });
+    }
+  }
+
+  @override
+  void dispose() {
+    _timer?.cancel();
+    super.dispose();
+  }
+
+  // ─────────── Servidor ───────────
+
+  Future<void> _persistCfg() async {
+    final p = await SharedPreferences.getInstance();
+    await p.setString(_kCfg, jsonEncode(cfg.toJson()));
+  }
+
+  /// Descarga catálogo y datos de cobro del servidor (con caché local si no hay red).
+  Future<void> refreshRemote() async {
+    if (!remote) return;
+    syncing = true;
+    notifyListeners();
+    try {
+      final list = await api.fetchProducts();
+      final s = await api.fetchSettings();
+      products = list;
+      cfg
+        ..businessName = s.businessName
+        ..whatsapp = s.whatsapp
+        ..cupCard = s.cupCard
+        ..mlcCard = s.mlcCard
+        ..tronAddress = s.tronAddress
+        ..trxPerUsdt = s.trxPerUsdt;
+      // Mantener el carrito alineado con el catálogo actual.
+      final old = cart.map((c) => MapEntry(c.product.id, c.qty)).toList();
+      cart.clear();
+      for (final e in old) {
+        final i = products.indexWhere((p) => p.id == e.key);
+        if (i >= 0) cart.add(CartItem(products[i], e.value));
+      }
+      await _saveProducts();
+      await _persistCfg();
+      syncError = null;
+    } on ApiException catch (e) {
+      syncError = e.message;
+    } catch (_) {
+      syncError = 'No se pudo actualizar la tienda';
+    }
+    syncing = false;
+    notifyListeners();
+  }
+
+  /// Actualiza estado y descargas de los pedidos de este teléfono.
+  Future<void> refreshOrders() async {
+    if (!remote) return;
+    final tokens = orders.map((o) => o.accessToken).where((t) => t.isNotEmpty).toList();
+    if (tokens.isEmpty) return;
+    try {
+      final rows = await api.myOrders(tokens);
+      final byId = {for (final r in rows) r['id'].toString(): r};
+      var changed = false;
+      orders = [
+        for (final o in orders)
+          if (byId.containsKey(o.id))
+            orderFromRow(byId[o.id]!, token: o.accessToken)
+          else
+            o
+      ];
+      for (final o in orders) {
+        if (byId.containsKey(o.id)) changed = true;
+      }
+      if (changed) {
+        await _saveOrders();
+        notifyListeners();
+      }
+    } catch (_) {
+      // Sin red: se conserva lo último guardado.
+    }
+  }
+
+  Future<void> sellerLogin(String email, String password) async {
+    await api.login(email, password);
+    try {
+      sellerOrders = await api.adminOrders();
+      adminProducts = await api.adminProducts();
+    } on ApiException catch (e) {
+      api.logout();
+      throw ApiException(
+          e.message == 'No autorizado' ? 'Esta cuenta no es de vendedor' : e.message);
+    }
+    notifyListeners();
+  }
+
+  Future<void> refreshSeller() async {
+    if (!remote || !api.isAdmin) return;
+    try {
+      sellerOrders = await api.adminOrders();
+      adminProducts = await api.adminProducts();
+    } on ApiException catch (e) {
+      syncError = e.message;
+    }
+    notifyListeners();
+  }
+
+  Future<void> adminSaveProduct(Product p) async {
+    await api.adminSaveProduct(p);
+    await refreshSeller();
+    await refreshRemote();
+  }
+
+  Future<void> adminDeleteProduct(String id) async {
+    await api.adminDeleteProduct(id);
+    await refreshSeller();
+    await refreshRemote();
+  }
+
+  Future<void> adminSaveSettings() async {
+    await api.adminSaveSettings(cfg);
+    await _persistCfg();
+    notifyListeners();
+  }
+
+  // Entrada discreta al panel del vendedor (7 toques en «Información»).
+  bool get sellerEntryVisible => _sellerVisible;
+
+  Future<bool> aboutTap() async {
+    if (_sellerVisible) return false;
+    _aboutTaps++;
+    if (_aboutTaps < 7) return false;
+    _sellerVisible = true;
+    final p = await SharedPreferences.getInstance();
+    await p.setBool(_kSellerVisible, true);
+    notifyListeners();
+    return true;
   }
 
   Future<void> _saveProducts() async {
@@ -4036,30 +4804,54 @@ class AppStore extends ChangeNotifier {
     String address = '',
     String fromWallet = '',
   }) async {
+    final lines = cart
+        .map((c) => OrderLine(
+              productId: c.product.id,
+              name: c.product.name,
+              kind: c.product.kind,
+              qty: c.qty,
+              unitCUP: c.product.priceCUP,
+              unitMLC: c.product.priceMLC,
+              unitUSDT: c.product.priceUSDT,
+              isDigital: c.product.isDigital,
+              // En modo servidor el enlace llega solo cuando el pago se verifica.
+              downloadUrl: remote ? '' : c.product.downloadUrl,
+            ))
+        .toList();
+    var id = DateTime.now().millisecondsSinceEpoch.toString();
+    var code = 'DLJ-${randomToken(6)}';
+    var token = '';
+    var amount = amountFor(method);
+    var created = DateTime.now();
+    if (remote) {
+      final r = await api.createOrder(
+        cart: List.of(cart),
+        method: method,
+        reference: reference.trim(),
+        name: name.trim(),
+        phone: phone.trim(),
+        address: address.trim(),
+        wallet: fromWallet.trim(),
+      );
+      id = r['id'].toString();
+      code = r['code'].toString();
+      token = r['access_token'].toString();
+      amount = double.tryParse(r['amount'].toString()) ?? amount;
+      created = DateTime.tryParse(r['created_at'].toString())?.toLocal() ?? created;
+    }
     final order = OrderRecord(
-      id: DateTime.now().millisecondsSinceEpoch.toString(),
-      code: 'DLJ-${randomToken(6)}',
-      lines: cart
-          .map((c) => OrderLine(
-                productId: c.product.id,
-                name: c.product.name,
-                kind: c.product.kind,
-                qty: c.qty,
-                unitCUP: c.product.priceCUP,
-                unitMLC: c.product.priceMLC,
-                unitUSDT: c.product.priceUSDT,
-                isDigital: c.product.isDigital,
-                downloadUrl: c.product.downloadUrl,
-              ))
-          .toList(),
+      id: id,
+      code: code,
+      accessToken: token,
+      lines: lines,
       method: method,
-      amount: amountFor(method),
+      amount: amount,
       reference: reference.trim(),
       customerName: name.trim(),
       phone: phone.trim(),
       address: address.trim(),
       fromWallet: fromWallet.trim(),
-      createdAt: DateTime.now(),
+      createdAt: created,
     );
     orders.insert(0, order);
     cart.clear();
@@ -4073,11 +4865,15 @@ class AppStore extends ChangeNotifier {
   }
 
   Future<void> setOrderStatus(OrderRecord o, OrderStatus s, {String note = ''}) async {
+    if (remote) await api.adminSetStatus(o.id, s, note.trim());
     o.status = s;
     if (note.trim().isNotEmpty) o.sellerNote = note.trim();
-    await _saveOrders();
+    if (!remote) await _saveOrders();
     notifyListeners();
   }
+
+  /// Pedidos que ve el vendedor: del servidor, o los locales si no hay servidor.
+  List<OrderRecord> get sellerList => remote ? sellerOrders : orders;
 
   /// Descargas liberadas: solo de pedidos con pago verificado por el vendedor.
   List<({OrderRecord order, OrderLine line})> get unlockedDownloads => [
@@ -4087,8 +4883,8 @@ class AppStore extends ChangeNotifier {
               if (l.isDigital && l.downloadUrl.isNotEmpty) (order: o, line: l),
       ];
 
-  int get pendingCount => orders.where((o) => o.status == OrderStatus.pending).length;
-  double get verifiedCUP => orders
+  int get pendingCount => sellerList.where((o) => o.status == OrderStatus.pending).length;
+  double get verifiedCUP => sellerList
       .where((o) => o.status.unlocksDownloads)
       .fold(0.0, (s, o) => s + o.totalCUP);
 
@@ -4130,6 +4926,11 @@ class AppStore extends ChangeNotifier {
   }
 
   void lockSeller() {
+    if (remote) {
+      api.logout();
+      sellerOrders = [];
+      adminProducts = [];
+    }
     sellerUnlocked = false;
     notifyListeners();
   }
@@ -4145,8 +4946,8 @@ class AppScope extends InheritedNotifier<AppStore> {
     return scope!.notifier!;
   }
 }
-DLJ_EOF_15
-cat > 'lib/theme/app_theme.dart' <<'DLJ_EOF_16'
+DLJ_EOF_16
+cat > 'lib/theme/app_theme.dart' <<'DLJ_EOF_17'
 import 'package:flutter/material.dart';
 
 /// Paleta tomada del logo de HANDMADE D.L.J STORE: azul marino profundo,
@@ -4284,8 +5085,8 @@ ThemeData buildTheme() {
     dividerColor: Palette.line,
   );
 }
-DLJ_EOF_16
-cat > 'lib/utils/helpers.dart' <<'DLJ_EOF_17'
+DLJ_EOF_17
+cat > 'lib/utils/helpers.dart' <<'DLJ_EOF_18'
 import 'dart:math';
 
 import 'package:crypto/crypto.dart';
@@ -4377,8 +5178,8 @@ Future<bool> openUrl(String url) async {
     return false;
   }
 }
-DLJ_EOF_17
-cat > 'lib/widgets/common.dart' <<'DLJ_EOF_18'
+DLJ_EOF_18
+cat > 'lib/widgets/common.dart' <<'DLJ_EOF_19'
 import 'dart:io';
 
 import 'package:flutter/material.dart';
@@ -4774,12 +5575,12 @@ InputDecoration fieldDec(String label, {String? hint, IconData? icon}) => InputD
       hintText: hint,
       prefixIcon: icon == null ? null : Icon(icon, size: 20),
     );
-DLJ_EOF_18
-cat > 'pubspec.yaml' <<'DLJ_EOF_19'
+DLJ_EOF_19
+cat > 'pubspec.yaml' <<'DLJ_EOF_20'
 name: tienda_cuba
 description: HANDMADE D.L.J STORE - Tienda de apps, juegos, arte, pintura, escultura y artesanías con pagos Transfermóvil CUP/MLC y crypto TRC20
 publish_to: 'none'
-version: 2.0.0+2
+version: 2.1.0+3
 
 environment:
   sdk: '>=3.2.0 <4.0.0'
@@ -4795,6 +5596,7 @@ dependencies:
   qr_flutter: ^4.1.0
   crypto: ^3.0.3
   intl: ^0.19.0
+  http: ^1.2.0
 
 dev_dependencies:
   flutter_test:
@@ -4805,14 +5607,14 @@ flutter:
   uses-material-design: true
   assets:
     - assets/images/logo.png
-DLJ_EOF_19
-cat > 'analysis_options.yaml' <<'DLJ_EOF_20'
+DLJ_EOF_20
+cat > 'analysis_options.yaml' <<'DLJ_EOF_21'
 include: package:flutter_lints/flutter.yaml
 linter:
   rules:
     prefer_const_constructors: false
     avoid_print: false
-DLJ_EOF_20
+DLJ_EOF_21
 base64 -d > assets/images/logo.png <<'DLJ_B64'
 iVBORw0KGgoAAAANSUhEUgAAAgAAAAIACAYAAAD0eNT6AAEAAElEQVR4nNT9eaAtSVEnjn8iq865
 973XKzTduIwrgigugwt+AYURATdQwQUFBBEUF0ARRwcZFgERUUEYFdn3RRAEhG42QWZGRwV1VHRA
