@@ -205,6 +205,8 @@ class Api {
       mlcCard: _s(m['mlc_card']),
       tronAddress: _s(m['tron_address']),
       trxPerUsdt: _d(m['trx_per_usdt']),
+      btcAddress: _s(m['btc_address']),
+      btcUsdtPrice: _d(m['btc_usdt_price']),
     );
   }
 
@@ -278,6 +280,20 @@ class Api {
     _refresh = null;
   }
 
+  /// Precio actual en USD (≈ USDT) desde CoinGecko, para ayudar a fijar las tasas.
+  Future<double> fetchUsdPrice(String coinId) async {
+    final r = await _guard(() => _c.get(Uri.parse(
+        'https://api.coingecko.com/api/v3/simple/price?ids=$coinId&vs_currencies=usd')));
+    if (r.statusCode != 200) {
+      throw ApiException('No se pudo obtener el precio actual. Escríbelo a mano.');
+    }
+    final j = jsonDecode(utf8.decode(r.bodyBytes));
+    final v = (j is Map && j[coinId] is Map) ? (j[coinId] as Map)['usd'] : null;
+    final price = _d(v);
+    if (price <= 0) throw ApiException('No se pudo obtener el precio actual. Escríbelo a mano.');
+    return price;
+  }
+
   // ─────────── Vendedor ───────────
 
   Future<List<OrderRecord>> adminOrders() async {
@@ -327,6 +343,8 @@ class Api {
           'mlc_card': c.mlcCard,
           'tron_address': c.tronAddress,
           'trx_per_usdt': c.trxPerUsdt,
+          'btc_address': c.btcAddress,
+          'btc_usdt_price': c.btcUsdtPrice,
         }
       });
 
@@ -619,6 +637,8 @@ class StoreConfig {
   String mlcCard;
   String tronAddress;
   double trxPerUsdt; // 0 = TRX desactivado
+  String btcAddress;
+  double btcUsdtPrice; // USDT por 1 BTC; 0 = Bitcoin desactivado
   String pinHash;
   String pinSalt;
 
@@ -629,6 +649,8 @@ class StoreConfig {
     this.mlcCard = '',
     this.tronAddress = '',
     this.trxPerUsdt = 0,
+    this.btcAddress = '',
+    this.btcUsdtPrice = 0,
     this.pinHash = '',
     this.pinSalt = '',
   });
@@ -637,6 +659,7 @@ class StoreConfig {
   bool get hasMlc => mlcCard.trim().isNotEmpty;
   bool get hasTron => tronAddress.trim().isNotEmpty;
   bool get hasTrx => hasTron && trxPerUsdt > 0;
+  bool get hasBtc => btcAddress.trim().isNotEmpty && btcUsdtPrice > 0;
   bool get hasWhatsapp => whatsapp.trim().isNotEmpty;
 
   Map<String, dynamic> toJson() => {
@@ -646,6 +669,8 @@ class StoreConfig {
         'mlcCard': mlcCard,
         'tronAddress': tronAddress,
         'trxPerUsdt': trxPerUsdt,
+        'btcAddress': btcAddress,
+        'btcUsdtPrice': btcUsdtPrice,
         'pinHash': pinHash,
         'pinSalt': pinSalt,
       };
@@ -657,6 +682,8 @@ class StoreConfig {
         mlcCard: (j['mlcCard'] as String?) ?? '',
         tronAddress: (j['tronAddress'] as String?) ?? '',
         trxPerUsdt: (j['trxPerUsdt'] as num?)?.toDouble() ?? 0,
+        btcAddress: (j['btcAddress'] as String?) ?? '',
+        btcUsdtPrice: (j['btcUsdtPrice'] as num?)?.toDouble() ?? 0,
         pinHash: (j['pinHash'] as String?) ?? '',
         pinSalt: (j['pinSalt'] as String?) ?? '',
       );
@@ -692,7 +719,7 @@ class CustomerProfile {
 
 // ───────────────────────── Pedidos ─────────────────────────
 
-enum PayMethod { transfermovilCup, transfermovilMlc, usdtTrc20, trx }
+enum PayMethod { transfermovilCup, transfermovilMlc, usdtTrc20, trx, btc }
 
 extension PayMethodX on PayMethod {
   String get label => switch (this) {
@@ -700,6 +727,7 @@ extension PayMethodX on PayMethod {
         PayMethod.transfermovilMlc => 'Transfermóvil MLC',
         PayMethod.usdtTrc20 => 'USDT · TRC20',
         PayMethod.trx => 'TRX · TRON',
+        PayMethod.btc => 'Bitcoin · BTC',
       };
 
   String get currencyCode => switch (this) {
@@ -707,11 +735,17 @@ extension PayMethodX on PayMethod {
         PayMethod.transfermovilMlc => 'MLC',
         PayMethod.usdtTrc20 => 'USDT',
         PayMethod.trx => 'TRX',
+        PayMethod.btc => 'BTC',
       };
 
-  bool get isCrypto => this == PayMethod.usdtTrc20 || this == PayMethod.trx;
+  bool get isCrypto =>
+      this == PayMethod.usdtTrc20 || this == PayMethod.trx || this == PayMethod.btc;
 
-  int get decimals => this == PayMethod.transfermovilCup ? 0 : 2;
+  int get decimals => switch (this) {
+        PayMethod.transfermovilCup => 0,
+        PayMethod.btc => 8,
+        _ => 2,
+      };
 }
 
 enum OrderStatus { pending, verified, rejected, delivered }
@@ -1317,6 +1351,7 @@ class _CheckoutPageState extends State<CheckoutPage> {
         PayMethod.transfermovilMlc => s.cfg.hasMlc,
         PayMethod.usdtTrc20 => s.cfg.hasTron,
         PayMethod.trx => s.cfg.hasTrx,
+        PayMethod.btc => s.cfg.hasBtc,
       };
 
   void _continue(AppStore store) {
@@ -1377,7 +1412,8 @@ class _CheckoutPageState extends State<CheckoutPage> {
             const _StepLabel(n: '2', text: 'Método de pago'),
             const SizedBox(height: 12),
             for (final m in PayMethod.values) ...[
-              if (m != PayMethod.trx || store.cfg.hasTrx)
+              if ((m != PayMethod.trx || store.cfg.hasTrx) &&
+                  (m != PayMethod.btc || store.cfg.hasBtc))
                 _MethodTile(
                   method: m,
                   amount: store.amountFor(m),
@@ -1464,7 +1500,9 @@ class _MethodTile extends StatelessWidget {
     final subtitle = !available
         ? 'No disponible por ahora'
         : method.isCrypto
-            ? 'Red TRON · confirmación en blockchain'
+            ? (method == PayMethod.btc
+                ? 'Red Bitcoin · confirmación en blockchain'
+                : 'Red TRON · confirmación en blockchain')
             : 'Transferencia desde Transfermóvil';
     final decimals = method.decimals;
     return Padding(
@@ -2078,8 +2116,8 @@ class _PaymentCryptoPageState extends State<PaymentCryptoPage> {
     setState(() => txid.text = t);
   }
 
-  Future<void> _openWallet(String address) async {
-    final ok = await openUrl('tron:$address');
+  Future<void> _openWallet(String uri) async {
+    final ok = await openUrl(uri);
     if (!ok && mounted) {
       toast(context, 'No se encontró una wallet compatible. Copia la dirección y pégala en tu wallet.');
     }
@@ -2095,7 +2133,7 @@ class _PaymentCryptoPageState extends State<PaymentCryptoPage> {
         name: widget.data.name,
         phone: widget.data.phone,
         address: widget.data.address,
-        fromWallet: store.profile.wallet,
+        fromWallet: widget.method == PayMethod.btc ? '' : store.profile.wallet,
       );
       if (!mounted) return;
       Navigator.of(context).pushAndRemoveUntil(
@@ -2113,10 +2151,13 @@ class _PaymentCryptoPageState extends State<PaymentCryptoPage> {
   Widget build(BuildContext context) {
     final store = AppScope.of(context);
     final m = widget.method;
-    final address = store.cfg.tronAddress.trim();
+    final isBtc = m == PayMethod.btc;
+    final address = (isBtc ? store.cfg.btcAddress : store.cfg.tronAddress).trim();
     final amount = store.amountFor(m);
     final isTrx = m == PayMethod.trx;
-    final asset = isTrx ? 'TRX' : 'USDT';
+    final asset = isBtc ? 'BTC' : (isTrx ? 'TRX' : 'USDT');
+    final amountText = amount.toStringAsFixed(m.decimals);
+    final walletUri = isBtc ? 'bitcoin:$address?amount=$amountText' : 'tron:$address';
 
     return Scaffold(
       appBar: AppBar(title: Text('Pagar con $asset')),
@@ -2137,7 +2178,7 @@ class _PaymentCryptoPageState extends State<PaymentCryptoPage> {
                 children: [
                   Row(
                     children: [
-                      const Pill('Red TRON · TRC20', icon: Icons.hub_rounded, color: Palette.gold),
+                      Pill(isBtc ? 'Red Bitcoin' : 'Red TRON · TRC20', icon: Icons.hub_rounded, color: Palette.gold),
                     ],
                   ),
                   const SizedBox(height: 16),
@@ -2147,7 +2188,7 @@ class _PaymentCryptoPageState extends State<PaymentCryptoPage> {
                   Row(
                     children: [
                       Expanded(
-                        child: Text('${amount.toStringAsFixed(2)} $asset',
+                        child: Text('$amountText $asset',
                             style: const TextStyle(
                                 color: Colors.white,
                                 fontSize: 32,
@@ -2156,7 +2197,7 @@ class _PaymentCryptoPageState extends State<PaymentCryptoPage> {
                       ),
                       IconButton.filled(
                         style: IconButton.styleFrom(backgroundColor: Colors.white.withOpacity(0.15)),
-                        onPressed: () => copyText(context, amount.toStringAsFixed(2), 'Monto'),
+                        onPressed: () => copyText(context, amountText, 'Monto'),
                         icon: const Icon(Icons.copy_rounded, size: 20, color: Colors.white),
                       ),
                     ],
@@ -2164,6 +2205,11 @@ class _PaymentCryptoPageState extends State<PaymentCryptoPage> {
                   if (isTrx) ...[
                     const SizedBox(height: 4),
                     Text('Tasa fijada por la tienda: 1 USDT = ${store.cfg.trxPerUsdt} TRX',
+                        style: const TextStyle(color: Colors.white54, fontSize: 12.5)),
+                  ],
+                  if (isBtc) ...[
+                    const SizedBox(height: 4),
+                    Text('Tasa fijada por la tienda: 1 BTC = ${store.cfg.btcUsdtPrice} USDT',
                         style: const TextStyle(color: Colors.white54, fontSize: 12.5)),
                   ],
                 ],
@@ -2184,9 +2230,11 @@ class _PaymentCryptoPageState extends State<PaymentCryptoPage> {
                   const SizedBox(width: 10),
                   Expanded(
                     child: Text(
-                      isTrx
-                          ? 'Envía solo TRX por la red TRON. Otro activo u otra red puede perder los fondos para siempre.'
-                          : 'Envía solo USDT por la red TRON (TRC20). Si usas otra red (ERC20, BEP20…) perderás los fondos.',
+                      isBtc
+                          ? 'Envía solo Bitcoin (BTC) por la red Bitcoin. Otro activo u otra red puede perder los fondos para siempre.'
+                          : (isTrx
+                              ? 'Envía solo TRX por la red TRON. Otro activo u otra red puede perder los fondos para siempre.'
+                              : 'Envía solo USDT por la red TRON (TRC20). Si usas otra red (ERC20, BEP20…) perderás los fondos.'),
                       style: const TextStyle(height: 1.35, fontSize: 13.5, fontWeight: FontWeight.w600),
                     ),
                   ),
@@ -2205,7 +2253,7 @@ class _PaymentCryptoPageState extends State<PaymentCryptoPage> {
                       border: Border.all(color: Palette.line),
                     ),
                     child: QrImageView(
-                      data: address,
+                      data: isBtc ? walletUri : address,
                       size: 190,
                       backgroundColor: Colors.white,
                       eyeStyle: const QrEyeStyle(eyeShape: QrEyeShape.square, color: Palette.navy),
@@ -2217,7 +2265,7 @@ class _PaymentCryptoPageState extends State<PaymentCryptoPage> {
                   CopyRow(label: 'Dirección de la tienda', value: address, display: address),
                   const SizedBox(height: 10),
                   OutlinedButton.icon(
-                    onPressed: () => _openWallet(address),
+                    onPressed: () => _openWallet(walletUri),
                     icon: const Icon(Icons.open_in_new_rounded, size: 18),
                     label: const Text('Abrir mi wallet'),
                   ),
@@ -2225,8 +2273,10 @@ class _PaymentCryptoPageState extends State<PaymentCryptoPage> {
               ),
             ),
             const SizedBox(height: 18),
-            _WalletBox(store: store, onChanged: () => setState(() {})),
-            const SizedBox(height: 18),
+            if (!isBtc) ...[
+              _WalletBox(store: store, onChanged: () => setState(() {})),
+              const SizedBox(height: 18),
+            ],
             TextFormField(
               controller: txid,
               minLines: 1,
@@ -3558,9 +3608,11 @@ class _SellerOrderCard extends StatelessWidget {
           if (o.method.isCrypto) ...[
             const SizedBox(height: 8),
             OutlinedButton.icon(
-              onPressed: () => openUrl('https://tronscan.org/#/transaction/${o.reference}'),
+              onPressed: () => openUrl(o.method == PayMethod.btc
+                  ? 'https://mempool.space/tx/${o.reference}'
+                  : 'https://tronscan.org/#/transaction/${o.reference}'),
               icon: const Icon(Icons.open_in_new_rounded, size: 17),
-              label: const Text('Ver en Tronscan'),
+              label: Text(o.method == PayMethod.btc ? 'Ver en Mempool' : 'Ver en Tronscan'),
             ),
           ],
           const SizedBox(height: 12),
@@ -4004,6 +4056,8 @@ class _SettingsTabState extends State<_SettingsTab> {
   final mlc = TextEditingController();
   final tron = TextEditingController();
   final trx = TextEditingController();
+  final btc = TextEditingController();
+  final btcPrice = TextEditingController();
   bool _init = false;
 
   @override
@@ -4018,11 +4072,13 @@ class _SettingsTabState extends State<_SettingsTab> {
     mlc.text = formatCard(c.mlcCard);
     tron.text = c.tronAddress;
     trx.text = c.trxPerUsdt > 0 ? c.trxPerUsdt.toString() : '';
+    btc.text = c.btcAddress;
+    btcPrice.text = c.btcUsdtPrice > 0 ? c.btcUsdtPrice.toString() : '';
   }
 
   @override
   void dispose() {
-    for (final c in [business, whatsapp, cup, mlc, tron, trx]) {
+    for (final c in [business, whatsapp, cup, mlc, tron, trx, btc, btcPrice]) {
       c.dispose();
     }
     super.dispose();
@@ -4043,6 +4099,8 @@ class _SettingsTabState extends State<_SettingsTab> {
     c.mlcCard = onlyDigits(mlc.text);
     c.tronAddress = tron.text.trim();
     c.trxPerUsdt = double.tryParse(trx.text.trim().replaceAll(',', '.')) ?? 0;
+    c.btcAddress = btc.text.trim();
+    c.btcUsdtPrice = double.tryParse(btcPrice.text.trim().replaceAll(',', '.')) ?? 0;
     try {
       if (store.remote) {
         await store.adminSaveSettings();
@@ -4050,6 +4108,23 @@ class _SettingsTabState extends State<_SettingsTab> {
         await store.saveConfig();
       }
       if (mounted) toast(context, 'Ajustes de cobro guardados');
+    } on ApiException catch (e) {
+      if (mounted) toast(context, e.message);
+    }
+  }
+
+  /// Rellena la tasa con el precio actual del mercado (puedes ajustarla a mano).
+  Future<void> _fillRate(AppStore store, {required bool forBtc}) async {
+    try {
+      final usd = await store.api.fetchUsdPrice(forBtc ? 'bitcoin' : 'tron');
+      if (!mounted) return;
+      setState(() {
+        if (forBtc) {
+          btcPrice.text = usd.toStringAsFixed(2);
+        } else {
+          trx.text = (1 / usd).toStringAsFixed(4);
+        }
+      });
     } on ApiException catch (e) {
       if (mounted) toast(context, e.message);
     }
@@ -4169,6 +4244,42 @@ class _SettingsTabState extends State<_SettingsTab> {
               final n = double.tryParse(t.replaceAll(',', '.'));
               return (n == null || n <= 0) ? 'Tasa no válida' : null;
             },
+          ),
+          TextButton.icon(
+            onPressed: () => _fillRate(store, forBtc: false),
+            icon: const Icon(Icons.refresh_rounded, size: 18),
+            label: const Text('Usar el precio actual de TRX'),
+          ),
+          const SizedBox(height: 24),
+          const Text('Bitcoin', style: TextStyle(fontSize: 17, fontWeight: FontWeight.w800)),
+          const SizedBox(height: 4),
+          const Text('Los precios se convierten con la tasa que fijes. Actualízala de vez en cuando.',
+              style: TextStyle(color: Palette.muted, fontSize: 12.5)),
+          const SizedBox(height: 10),
+          TextFormField(
+            controller: btc,
+            decoration: fieldDec('Tu dirección Bitcoin (bc1… / 1… / 3…)', icon: Icons.currency_bitcoin_rounded),
+            validator: (v) {
+              final a = (v ?? '').trim();
+              return a.isEmpty || isValidBtcAddress(a) ? null : 'Dirección Bitcoin no válida';
+            },
+          ),
+          const SizedBox(height: 12),
+          TextFormField(
+            controller: btcPrice,
+            keyboardType: const TextInputType.numberWithOptions(decimal: true),
+            decoration: fieldDec('USDT por cada 1 BTC', hint: 'Vacío = no aceptar Bitcoin', icon: Icons.swap_horiz_rounded),
+            validator: (v) {
+              final t = (v ?? '').trim();
+              if (t.isEmpty) return null;
+              final n = double.tryParse(t.replaceAll(',', '.'));
+              return (n == null || n <= 0) ? 'Precio no válido' : null;
+            },
+          ),
+          TextButton.icon(
+            onPressed: () => _fillRate(store, forBtc: true),
+            icon: const Icon(Icons.refresh_rounded, size: 18),
+            label: const Text('Usar el precio actual de Bitcoin'),
           ),
           const SizedBox(height: 22),
           CoralButton(label: 'Guardar ajustes', icon: Icons.check_rounded, onPressed: () => _save(store)),
@@ -4598,7 +4709,9 @@ class AppStore extends ChangeNotifier {
         ..cupCard = s.cupCard
         ..mlcCard = s.mlcCard
         ..tronAddress = s.tronAddress
-        ..trxPerUsdt = s.trxPerUsdt;
+        ..trxPerUsdt = s.trxPerUsdt
+        ..btcAddress = s.btcAddress
+        ..btcUsdtPrice = s.btcUsdtPrice;
       // Mantener el carrito alineado con el catálogo actual.
       final old = cart.map((c) => MapEntry(c.product.id, c.qty)).toList();
       cart.clear();
@@ -4794,6 +4907,8 @@ class AppStore extends ChangeNotifier {
         PayMethod.transfermovilMlc => cartTotal(Cur.mlc),
         PayMethod.usdtTrc20 => cartTotal(Cur.usdt),
         PayMethod.trx => cartTotal(Cur.usdt) * cfg.trxPerUsdt,
+        PayMethod.btc =>
+          cfg.btcUsdtPrice > 0 ? cartTotal(Cur.usdt) / cfg.btcUsdtPrice : 0,
       };
 
   Future<OrderRecord> createOrder({
@@ -5103,8 +5218,9 @@ final _decFmt = NumberFormat('#,##0.00', 'en_US');
 String money(double v, Cur c) =>
     '${c == Cur.cup ? _cupFmt.format(v) : _decFmt.format(v)} ${c.code}';
 
-String moneyPlain(double v, int decimals) =>
-    decimals == 0 ? _cupFmt.format(v) : _decFmt.format(v);
+String moneyPlain(double v, int decimals) => decimals == 0
+    ? _cupFmt.format(v)
+    : (decimals == 2 ? _decFmt.format(v) : v.toStringAsFixed(decimals));
 
 String formatDate(DateTime d) => DateFormat('dd/MM/yyyy · HH:mm').format(d);
 
@@ -5155,6 +5271,87 @@ bool isValidTronAddress(String address) {
     if (check[i] != bytes[21 + i]) return false;
   }
   return true;
+}
+
+const _b58Alphabet = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
+const _bech32Charset = 'qpzry9x8gf2tvdw0s3jn54khce6mua7l';
+
+/// Base58Check de 25 bytes (versión + 20 bytes + 4 de checksum).
+bool _base58Check25(String a, Set<int> versions) {
+  var n = BigInt.zero;
+  final base = BigInt.from(58);
+  for (final ch in a.split('')) {
+    final i = _b58Alphabet.indexOf(ch);
+    if (i < 0) return false;
+    n = n * base + BigInt.from(i);
+  }
+  final bytes = List<int>.filled(25, 0);
+  final mask = BigInt.from(0xff);
+  for (var i = 24; i >= 0; i--) {
+    bytes[i] = (n & mask).toInt();
+    n = n >> 8;
+  }
+  if (n != BigInt.zero || !versions.contains(bytes[0])) return false;
+  final check = sha256.convert(sha256.convert(bytes.sublist(0, 21)).bytes).bytes;
+  for (var i = 0; i < 4; i++) {
+    if (check[i] != bytes[21 + i]) return false;
+  }
+  return true;
+}
+
+int _bech32Polymod(List<int> values) {
+  const gen = [0x3b6a57b2, 0x26508e6d, 0x1ea119fa, 0x3d4233dd, 0x2a1462b3];
+  var chk = 1;
+  for (final v in values) {
+    final b = chk >> 25;
+    chk = ((chk & 0x1ffffff) << 5) ^ v;
+    for (var i = 0; i < 5; i++) {
+      if (((b >> i) & 1) == 1) chk ^= gen[i];
+    }
+  }
+  return chk;
+}
+
+bool _isValidBech32Btc(String addr) {
+  if (addr != addr.toLowerCase() && addr != addr.toUpperCase()) return false;
+  final a = addr.toLowerCase();
+  final pos = a.lastIndexOf('1');
+  if (pos < 1 || pos + 7 > a.length || a.length > 90) return false;
+  final hrp = a.substring(0, pos);
+  if (hrp != 'bc') return false;
+  final data = <int>[];
+  for (final ch in a.substring(pos + 1).split('')) {
+    final i = _bech32Charset.indexOf(ch);
+    if (i < 0) return false;
+    data.add(i);
+  }
+  final values = <int>[
+    ...hrp.codeUnits.map((c) => c >> 5),
+    0,
+    ...hrp.codeUnits.map((c) => c & 31),
+    ...data,
+  ];
+  final pm = _bech32Polymod(values);
+  final witnessVersion = data[0];
+  if (witnessVersion > 16) return false;
+  if (witnessVersion == 0) {
+    if (pm != 1) return false;
+  } else if (pm != 0x2bc830a3) {
+    return false;
+  }
+  final programBytes = ((data.length - 7) * 5) ~/ 8;
+  if (witnessVersion == 0 && programBytes != 20 && programBytes != 32) return false;
+  return programBytes >= 2 && programBytes <= 40;
+}
+
+/// Valida una dirección Bitcoin de mainnet (1…, 3…, bc1…) comprobando su checksum,
+/// para detectar errores de tecleo antes de que alguien envíe dinero.
+bool isValidBtcAddress(String address) {
+  final a = address.trim();
+  if (a.length < 14 || a.length > 90) return false;
+  if (a.toLowerCase().startsWith('bc1')) return _isValidBech32Btc(a);
+  if (a[0] != '1' && a[0] != '3') return false;
+  return _base58Check25(a, a[0] == '1' ? {0x00} : {0x05});
 }
 
 bool isValidTxId(String s) => RegExp(r'^[0-9a-fA-F]{64}$').hasMatch(s.trim());
@@ -8785,7 +8982,7 @@ if 'android.permission.INTERNET' not in s:
 s = re.sub(r'android:label="[^"]*"', 'android:label="D.L.J STORE"', s, count=1)
 intents = ''.join(
     '\n        <intent><action android:name="android.intent.action.VIEW"/><data android:scheme="%s"/></intent>' % sc
-    for sc in ('https', 'http', 'whatsapp', 'tron')
+    for sc in ('https', 'http', 'whatsapp', 'tron', 'bitcoin')
 )
 if '<queries>' in s:
     s = s.replace('<queries>', '<queries>' + intents, 1)
