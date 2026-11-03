@@ -3527,6 +3527,31 @@ class _FilterChip extends StatelessWidget {
   }
 }
 
+class _SmsResult extends StatelessWidget {
+  final ({bool reference, bool amount}) r;
+  const _SmsResult(this.r);
+
+  @override
+  Widget build(BuildContext context) {
+    final ok = r.reference && r.amount;
+    final text = ok
+        ? '✓ Coinciden la referencia y el monto.'
+        : r.reference
+            ? '⚠ La referencia coincide, pero el monto no. Revísalo antes de verificar.'
+            : '✗ No se encontró la referencia del pedido en ese texto.';
+    final color = ok ? Palette.ok : (r.reference ? Palette.warn : Palette.danger);
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: color.withOpacity(0.1),
+        borderRadius: BorderRadius.circular(12),
+      ),
+      child: Text(text, style: TextStyle(color: color, fontWeight: FontWeight.w700, height: 1.35)),
+    );
+  }
+}
+
 class _SellerOrderCard extends StatelessWidget {
   final OrderRecord order;
   final AppStore store;
@@ -3538,6 +3563,72 @@ class _SellerOrderCard extends StatelessWidget {
       if (ok != null && context.mounted) toast(context, ok);
     } on ApiException catch (e) {
       if (context.mounted) toast(context, e.message);
+    }
+  }
+
+  /// Compara el SMS de Transfermóvil con el pedido (referencia y monto).
+  Future<void> _checkSms(BuildContext context) async {
+    final ctrl = TextEditingController();
+    ({bool reference, bool amount})? res;
+    await showDialog<void>(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setD) => AlertDialog(
+          title: const Text('Comprobar con el SMS'),
+          content: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const Text('Pega el SMS o el comprobante que recibiste de Transfermóvil.',
+                    style: TextStyle(fontSize: 13, color: Palette.muted)),
+                const SizedBox(height: 10),
+                TextField(controller: ctrl, maxLines: 4, decoration: fieldDec('Texto del SMS')),
+                if (res != null) ...[
+                  const SizedBox(height: 12),
+                  _SmsResult(res!),
+                ],
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cerrar')),
+            FilledButton(
+              style: FilledButton.styleFrom(minimumSize: const Size(120, 44)),
+              onPressed: () => setD(() => res = smsCheck(ctrl.text, order)),
+              child: const Text('Comprobar'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// Pide confirmar que el dinero llegó de verdad antes de liberar la descarga.
+  Future<void> _verify(BuildContext context) async {
+    final o = order;
+    final amount = '${moneyPlain(o.amount, o.method.decimals)} ${o.method.currencyCode}';
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('¿Ya recibiste el dinero?'),
+        content: Text(
+          'Pedido ${o.code}\n$amount · ${o.method.label}\nReferencia: ${o.reference}\n\n'
+          'Comprueba en tu banco o wallet que el pago llegó. '
+          'Al verificar, el cliente podrá descargar su compra.',
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancelar')),
+          FilledButton(
+            style: FilledButton.styleFrom(
+                backgroundColor: Palette.ok, minimumSize: const Size(120, 44)),
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Sí, ya llegó'),
+          ),
+        ],
+      ),
+    );
+    if (ok == true && context.mounted) {
+      await _set(context, OrderStatus.verified, ok: 'Pago verificado · descargas liberadas');
     }
   }
 
@@ -3612,6 +3703,17 @@ class _SellerOrderCard extends StatelessWidget {
               label: Text(o.method == PayMethod.btc ? 'Ver en Mempool' : 'Ver en Tronscan'),
             ),
           ],
+          if (o.sellerNote.isNotEmpty) ...[
+            const SizedBox(height: 10),
+            Container(
+              padding: const EdgeInsets.all(10),
+              decoration: BoxDecoration(
+                color: Palette.warn.withOpacity(0.1),
+                borderRadius: BorderRadius.circular(12),
+              ),
+              child: Text(o.sellerNote, style: const TextStyle(fontSize: 12.5, height: 1.35)),
+            ),
+          ],
           const SizedBox(height: 12),
           Text('${o.customerName} · ${o.phone}', style: const TextStyle(fontWeight: FontWeight.w700)),
           if (o.address.isNotEmpty)
@@ -3626,6 +3728,15 @@ class _SellerOrderCard extends StatelessWidget {
                   style: const TextStyle(color: Palette.muted, fontSize: 13)),
             ),
           const SizedBox(height: 14),
+          if (o.status == OrderStatus.pending && !o.method.isCrypto)
+            Padding(
+              padding: const EdgeInsets.only(bottom: 10),
+              child: OutlinedButton.icon(
+                onPressed: () => _checkSms(context),
+                icon: const Icon(Icons.sms_rounded, size: 18),
+                label: const Text('Comprobar con el SMS'),
+              ),
+            ),
           if (o.status == OrderStatus.pending)
             Row(
               children: [
@@ -3643,8 +3754,7 @@ class _SellerOrderCard extends StatelessWidget {
                   child: FilledButton(
                     style: FilledButton.styleFrom(
                         backgroundColor: Palette.ok, minimumSize: const Size.fromHeight(48)),
-                    onPressed: () => _set(context, OrderStatus.verified,
-                        ok: 'Pago verificado · descargas liberadas'),
+                    onPressed: () => _verify(context),
                     child: const Text('Verificar pago'),
                   ),
                 ),
@@ -3654,6 +3764,17 @@ class _SellerOrderCard extends StatelessWidget {
             FilledButton(
               onPressed: () => _set(context, OrderStatus.delivered, ok: 'Marcado como entregado'),
               child: const Text('Marcar como entregado'),
+            ),
+          if (o.status == OrderStatus.verified || o.status == OrderStatus.delivered)
+            Padding(
+              padding: const EdgeInsets.only(top: 8),
+              child: OutlinedButton(
+                style: OutlinedButton.styleFrom(
+                    foregroundColor: Palette.danger, minimumSize: const Size.fromHeight(48)),
+                onPressed: () => _set(context, OrderStatus.pending,
+                    ok: 'Devuelto a pendiente · descarga bloqueada'),
+                child: const Text('Revertir a pendiente (bloquear descarga)'),
+              ),
             ),
           if (o.status == OrderStatus.rejected)
             OutlinedButton(
@@ -4309,6 +4430,7 @@ cat > 'lib/screens/shell.dart' <<'DLJ_EOF_14'
 import 'package:flutter/material.dart';
 
 import '../state/app_store.dart';
+import '../utils/helpers.dart';
 import 'account_page.dart';
 import 'cart_page.dart';
 import 'home_page.dart';
@@ -4322,6 +4444,28 @@ class MainShell extends StatefulWidget {
 
 class _MainShellState extends State<MainShell> {
   int index = 0;
+  AppStore? _store;
+
+  @override
+  void initState() {
+    super.initState();
+    _store = context.getInheritedWidgetOfExactType<AppScope>()?.notifier;
+    _store?.addListener(_onStore);
+  }
+
+  void _onStore() {
+    final s = _store;
+    if (s == null || !mounted || s.notice == null) return;
+    final msg = s.notice!;
+    s.notice = null;
+    toast(context, msg);
+  }
+
+  @override
+  void dispose() {
+    _store?.removeListener(_onStore);
+    super.dispose();
+  }
 
   void goTo(int i) => setState(() => index = i);
 
@@ -4633,6 +4777,8 @@ class AppStore extends ChangeNotifier {
   bool _sellerVisible = !kRemote;
   // Foto elegida cuando Android cerró la app mientras estaba abierta la galería.
   String pendingImage = '';
+  // Aviso para el cliente cuando el vendedor verifica o rechaza su pedido.
+  String? notice;
   int _aboutTaps = 0;
   Timer? _timer;
 
@@ -4755,6 +4901,7 @@ class AppStore extends ChangeNotifier {
     try {
       final rows = await api.myOrders(tokens);
       final byId = {for (final r in rows) r['id'].toString(): r};
+      final before = {for (final o in orders) o.id: o.status};
       var changed = false;
       orders = [
         for (final o in orders)
@@ -4765,6 +4912,13 @@ class AppStore extends ChangeNotifier {
       ];
       for (final o in orders) {
         if (byId.containsKey(o.id)) changed = true;
+        if (before[o.id] == OrderStatus.pending) {
+          if (o.status.unlocksDownloads) {
+            notice = 'Tu pago del pedido ${o.code} fue verificado. Ya puedes descargar tu compra.';
+          } else if (o.status == OrderStatus.rejected) {
+            notice = 'Tu pedido ${o.code} no pudo verificarse. Revisa los detalles en Compras.';
+          }
+        }
       }
       if (changed) {
         await _saveOrders();
@@ -5368,6 +5522,26 @@ bool isValidBtcAddress(String address) {
   if (a.toLowerCase().startsWith('bc1')) return _isValidBech32Btc(a);
   if (a[0] != '1' && a[0] != '3') return false;
   return _base58Check25(a, a[0] == '1' ? {0x00} : {0x05});
+}
+
+/// Compara el texto de un SMS o comprobante de Transfermóvil con un pedido.
+({bool reference, bool amount}) smsCheck(String text, OrderRecord order) {
+  final norm = text.toLowerCase().replaceAll(RegExp(r'\s+'), '');
+  final ref = order.reference.toLowerCase().replaceAll(RegExp(r'\s+'), '');
+  final refOk = ref.length >= 4 && norm.contains(ref);
+  final tolerance = order.method.decimals == 0 ? 0.5 : 0.011;
+  var amountOk = false;
+  for (final m in RegExp(r'\d[\d.,]*').allMatches(text)) {
+    final t = m.group(0)!;
+    final candidates = <double?>[
+      double.tryParse(t.replaceAll(',', '')),
+      double.tryParse(t.replaceAll('.', '').replaceAll(',', '.')),
+    ];
+    for (final c in candidates) {
+      if (c != null && (c - order.amount).abs() < tolerance) amountOk = true;
+    }
+  }
+  return (reference: refOk, amount: amountOk);
 }
 
 bool isValidTxId(String s) => RegExp(r'^[0-9a-fA-F]{64}$').hasMatch(s.trim());
