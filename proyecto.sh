@@ -1047,15 +1047,22 @@ class AccountPage extends StatelessWidget {
         ),
         const SectionTitle('Ajustes'),
         _Tile(
-          icon: Icons.admin_panel_settings_rounded,
+          icon: Icons.storefront_rounded,
           title: 'Acceso de vendedor',
+          subtitle: 'Solicitar ser vendedor, publicar productos y ver tus ventas',
+          trailing: const Icon(Icons.chevron_right_rounded),
+          onTap: () => Navigator.of(context).push(MaterialPageRoute(builder: (_) => const SellerGate())),
+        ),
+        _Tile(
+          icon: Icons.admin_panel_settings_rounded,
+          title: 'Acceso administrador',
           subtitle: store.pendingCount > 0
-              ? '${store.pendingCount} pedido(s) por verificar'
-              : 'Catálogo, pedidos, tarjetas de cobro y wallets',
+              ? '${store.pendingCount} pedido(s) por verificar · Aprobar vendedores'
+              : 'Aprobar vendedores, productos, pedidos y comisión',
           trailing: store.pendingCount > 0
               ? Badge(label: Text('${store.pendingCount}'))
               : const Icon(Icons.chevron_right_rounded),
-          onTap: () => Navigator.of(context).push(MaterialPageRoute(builder: (_) => const SellerGate())),
+          onTap: () => Navigator.of(context).push(MaterialPageRoute(builder: (_) => const SellerGate(adminEntry: true))),
         ),
         const SectionTitle('Información'),
         _Tile(
@@ -1064,8 +1071,10 @@ class AccountPage extends StatelessWidget {
           subtitle: 'Versión 2.2 · Apps, juegos, arte, pintura, escultura y artesanías',
           trailing: const SizedBox.shrink(),
           onTap: () async {
-            final revealed = await store.aboutTap();
-            if (revealed && context.mounted) toast(context, 'Modo vendedor activado');
+            final revealed = await store.revealAdminEntry();
+            if (revealed && context.mounted) {
+              toast(context, 'Acceso administrador activado en este teléfono');
+            }
           },
         ),
         const SizedBox(height: 30),
@@ -3174,13 +3183,14 @@ import '../widgets/common.dart';
 // ───────────────────────── Acceso con PIN ─────────────────────────
 
 class SellerGate extends StatelessWidget {
-  const SellerGate({super.key});
+  const SellerGate({super.key, this.adminEntry = false});
+  final bool adminEntry;
 
   @override
   Widget build(BuildContext context) {
     final store = AppScope.of(context);
     if (store.remote) {
-      if (!store.api.isAdmin) return const _LoginScreen();
+      if (!store.api.isAdmin) return _LoginScreen(adminEntry: adminEntry);
       return const MarketplaceDashboard();
     }
     if (store.sellerUnlocked) return const SellerDashboard();
@@ -3190,7 +3200,8 @@ class SellerGate extends StatelessWidget {
 
 /// Entrada del vendedor cuando la tienda usa servidor: correo y contraseña.
 class _LoginScreen extends StatefulWidget {
-  const _LoginScreen();
+  const _LoginScreen({this.adminEntry = false});
+  final bool adminEntry;
   @override
   State<_LoginScreen> createState() => _LoginScreenState();
 }
@@ -3230,18 +3241,21 @@ class _LoginScreenState extends State<_LoginScreen> {
   Widget build(BuildContext context) {
     final store = AppScope.of(context);
     return Scaffold(
-      appBar: AppBar(title: const Text('Panel del vendedor')),
+      appBar: AppBar(title: Text(widget.adminEntry ? 'Administración' : 'Panel del vendedor')),
       body: ListView(
         padding: const EdgeInsets.fromLTRB(24, 20, 24, 30),
         children: [
           const Center(child: BrandLogo(size: 84)),
           const SizedBox(height: 22),
-          const Text('Acceso de vendedor',
+          Text(widget.adminEntry ? 'Acceso administrador' : 'Acceso de vendedor',
               textAlign: TextAlign.center,
-              style: TextStyle(fontSize: 22, fontWeight: FontWeight.w800)),
+              style: const TextStyle(fontSize: 22, fontWeight: FontWeight.w800)),
           const SizedBox(height: 6),
-          const Text('Entra con la cuenta que creaste en tu servidor.',
-              textAlign: TextAlign.center, style: TextStyle(color: Palette.muted, height: 1.4)),
+          Text(
+              widget.adminEntry
+                  ? 'Entra con el correo de administrador (el que está en la tabla admins de Supabase).'
+                  : 'Entra con la cuenta de vendedor que creaste en el servidor.',
+              textAlign: TextAlign.center, style: const TextStyle(color: Palette.muted, height: 1.4)),
           const SizedBox(height: 26),
           TextField(
             controller: email,
@@ -4932,6 +4946,7 @@ class AppStore extends ChangeNotifier {
   String marketplaceRole = '';
   String sellerStatus = 'none';
   bool _sellerVisible = !kRemote;
+  bool _adminVisible = false;
   // Foto elegida cuando Android cerró la app mientras estaba abierta la galería.
   String pendingImage = '';
   // Aviso para el cliente cuando el vendedor verifica o rechaza su pedido.
@@ -4950,6 +4965,7 @@ class AppStore extends ChangeNotifier {
   static const _kOrders = 'djl2_orders';
   static const _kCurrency = 'djl2_currency';
   static const _kSellerVisible = 'djl2_seller_visible';
+  static const _kAdminVisible = 'djl2_admin_visible';
 
   // ─────────── Carga / guardado ───────────
 
@@ -4977,7 +4993,10 @@ class AppStore extends ChangeNotifier {
       }
       final cur = p.getString(_kCurrency);
       currency = Cur.values.firstWhere((e) => e.name == cur, orElse: () => Cur.cup);
-      if (remote) _sellerVisible = p.getBool(_kSellerVisible) ?? false;
+      if (remote) {
+        _sellerVisible = p.getBool(_kSellerVisible) ?? false;
+        _adminVisible = p.getBool(_kAdminVisible) ?? false;
+      }
     } catch (_) {
       // Si algún dato guardado está dañado, arrancamos con el catálogo base.
       if (products.isEmpty && !remote) products = seedProducts();
@@ -5095,6 +5114,7 @@ class AppStore extends ChangeNotifier {
         marketplaceRole = 'admin';
         marketplaceApplications = await api.adminSellerApplications();
         marketplaceProducts = await api.adminMarketplaceProducts();
+        await markAdminEntryVisible();
       } on ApiException {
         final status = await api.mySellerStatus();
         sellerStatus = (status['seller_status'] ?? 'none').toString();
@@ -5190,6 +5210,27 @@ class AppStore extends ChangeNotifier {
 
   // Entrada discreta al panel del vendedor (7 toques en «Información»).
   bool get sellerEntryVisible => _sellerVisible;
+  bool get adminEntryVisible => _adminVisible || api.isAdmin;
+
+  /// Solo el dueño: 7 toques en «HANDMADE D.L.J STORE» en Ajustes.
+  Future<bool> revealAdminEntry() async {
+    if (_adminVisible) return false;
+    _aboutTaps++;
+    if (_aboutTaps < 7) return false;
+    _adminVisible = true;
+    final p = await SharedPreferences.getInstance();
+    await p.setBool(_kAdminVisible, true);
+    notifyListeners();
+    return true;
+  }
+
+  Future<void> markAdminEntryVisible() async {
+    if (_adminVisible) return;
+    _adminVisible = true;
+    final p = await SharedPreferences.getInstance();
+    await p.setBool(_kAdminVisible, true);
+    notifyListeners();
+  }
 
   Future<bool> aboutTap() async {
     if (_sellerVisible) return false;
