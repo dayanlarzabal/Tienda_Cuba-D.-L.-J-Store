@@ -71,6 +71,11 @@ Product productFromRow(Map<String, dynamic> m) => Product(
       badge: _s(m['badge']),
       featured: m['featured'] == true,
       active: m['active'] == null ? true : m['active'] == true,
+      sellerId: _s(m['seller_id']),
+      sellerName: _s(m['seller_name']),
+      publicationStatus: _s(m['publication_status']).isEmpty ? 'approved' : _s(m['publication_status']),
+      rejectionNote: _s(m['rejection_note']),
+      commissionRate: _d(m['commission_rate']),
     );
 
 OrderRecord orderFromRow(Map<String, dynamic> m, {String token = ''}) {
@@ -120,10 +125,13 @@ class Api {
   final http.Client _c = http.Client();
   String? _access;
   String? _refresh;
+  String? _userId;
 
   static const _timeout = Duration(seconds: 25);
 
   bool get isAdmin => _access != null;
+  bool get isLoggedIn => _access != null;
+  String? get userId => _userId;
 
   Map<String, String> _headers({bool json = true}) => {
         'apikey': kSupabaseAnonKey,
@@ -256,6 +264,8 @@ class Api {
     final j = jsonDecode(utf8.decode(r.bodyBytes)) as Map<String, dynamic>;
     _access = j['access_token'] as String?;
     _refresh = j['refresh_token'] as String?;
+    final u = j['user'];
+    if (u is Map && u['id'] != null) _userId = u['id'].toString();
   }
 
   Future<void> _refreshSession() async {
@@ -273,11 +283,14 @@ class Api {
     final j = jsonDecode(utf8.decode(r.bodyBytes)) as Map<String, dynamic>;
     _access = j['access_token'] as String?;
     _refresh = j['refresh_token'] as String?;
+    final u = j['user'];
+    if (u is Map && u['id'] != null) _userId = u['id'].toString();
   }
 
   void logout() {
     _access = null;
     _refresh = null;
+    _userId = null;
   }
 
   /// Precio actual en USD (≈ USDT) desde CoinGecko, para ayudar a fijar las tasas.
@@ -294,73 +307,133 @@ class Api {
     return price;
   }
 
-  // ─────────── Marketplace multi-vendedor ───────────
+  // ─────────── Marketplace: cuentas y vendedores ───────────
 
-  Future<void> signUp(String email, String password, String name) async {
+  /// Crea una cuenta. Devuelve true si ya quedó con sesión iniciada
+  /// (false si Supabase exige confirmar el correo primero).
+  Future<bool> signUp(String email, String password, String name) async {
     final r = await _guard(() => _c.post(
-      Uri.parse('$kSupabaseUrl/auth/v1/signup'),
-      headers: {'apikey': kSupabaseAnonKey, 'Content-Type': 'application/json'},
-      body: jsonEncode({'email': email.trim(), 'password': password,
-        'data': {'name': name.trim()}}),
-    ));
-    if (r.statusCode < 200 || r.statusCode >= 300) throw ApiException(_errorMessage(r));
+          Uri.parse('$kSupabaseUrl/auth/v1/signup'),
+          headers: {'apikey': kSupabaseAnonKey, 'Content-Type': 'application/json'},
+          body: jsonEncode({
+            'email': email.trim(),
+            'password': password,
+            'data': {'name': name.trim()},
+          }),
+        ));
+    if (r.statusCode < 200 || r.statusCode >= 300) {
+      final msg = _errorMessage(r);
+      final low = msg.toLowerCase();
+      if (low.contains('already') || low.contains('registered')) {
+        throw ApiException('Ese correo ya tiene una cuenta. Entra con tu contraseña.');
+      }
+      if (low.contains('password')) {
+        throw ApiException('La contraseña es muy débil. Usa al menos 6 caracteres.');
+      }
+      throw ApiException(msg);
+    }
+    final j = jsonDecode(utf8.decode(r.bodyBytes));
+    if (j is Map && j['access_token'] != null) {
+      _access = j['access_token'] as String?;
+      _refresh = j['refresh_token'] as String?;
+      final u = j['user'];
+      if (u is Map && u['id'] != null) _userId = u['id'].toString();
+      return true;
+    }
+    return false;
   }
 
-  Future<Map<String, dynamic>> mySellerStatus() async =>
-      Map<String, dynamic>.from(await _rpc('dlj_my_seller_status') as Map);
+  Future<Map<String, dynamic>> myRole() async =>
+      Map<String, dynamic>.from(await _rpc('dlj_my_role') as Map);
 
-  Future<void> applyAsSeller(String business, String description, String phone) async {
-    await _rpc('dlj_apply_as_seller', {'p_business_name': business,
-      'p_description': description, 'p_phone': phone});
+  Future<double> marketplaceCommission() async {
+    final j = await _rpc('dlj_marketplace_info');
+    if (j is Map) return _d(j['default_commission']);
+    return 10;
   }
+
+  Future<void> applyAsSeller(String business, String description, String phone) =>
+      _rpc('dlj_apply_as_seller', {
+        'p_business_name': business,
+        'p_description': description,
+        'p_phone': phone,
+        'p_accept': true,
+      });
+
+  Future<void> updateSellerProfile(Map<String, dynamic> data) =>
+      _rpc('dlj_update_seller_profile', {'p': data});
 
   Future<List<Product>> sellerProducts() async {
     final j = await _rpc('dlj_seller_products');
-    final rows = j is List ? j : <dynamic>[];
-    return rows.map((e) => productFromRow(Map<String,dynamic>.from(e as Map))).toList();
+    return (j as List).map((e) => productFromRow(Map<String, dynamic>.from(e as Map))).toList();
   }
 
   Future<void> sellerSaveProduct(Product p) async {
-    await _rpc('dlj_seller_save_product', {'p': {
-      'id': RegExp(r'^[0-9a-fA-F-]{36}$').hasMatch(p.id) ? p.id : null,
-      'name': p.name, 'subtitle': p.subtitle, 'description': p.description,
-      'kind': p.kind.name, 'price_cup': p.priceCUP, 'price_mlc': p.priceMLC,
-      'price_usdt': p.priceUSDT, 'image_url': p.imageUrl,
-      'download_url': p.downloadUrl, 'is_digital': p.isDigital,
-      'badge': p.badge,
-    }});
+    final isUuid = RegExp(r'^[0-9a-fA-F-]{36}$').hasMatch(p.id);
+    await _rpc('dlj_seller_save_product', {
+      'p': {
+        'id': isUuid ? p.id : null,
+        'name': p.name,
+        'subtitle': p.subtitle,
+        'description': p.description,
+        'kind': p.kind.name,
+        'price_cup': p.priceCUP,
+        'price_mlc': p.priceMLC,
+        'price_usdt': p.priceUSDT,
+        'image_url': p.imageUrl,
+        'download_url': p.downloadUrl,
+        'is_digital': p.isDigital,
+        'badge': p.badge,
+      }
+    });
   }
 
-  Future<void> sellerDeleteProduct(String id) =>
-      _rpc('dlj_seller_delete_product', {'p_id': id});
+  Future<void> sellerDeleteProduct(String id) => _rpc('dlj_seller_delete_product', {'p_id': id});
 
-  Future<List<Map<String,dynamic>>> sellerSales() async {
+  Future<List<Map<String, dynamic>>> sellerSales() async {
     final j = await _rpc('dlj_seller_orders');
-    return (j as List).map((e) => Map<String,dynamic>.from(e as Map)).toList();
+    return (j as List).map((e) => Map<String, dynamic>.from(e as Map)).toList();
   }
 
-  Future<List<Map<String,dynamic>>> adminSellerApplications() async {
+  Future<Map<String, dynamic>> sellerBalance() async =>
+      Map<String, dynamic>.from(await _rpc('dlj_seller_balance') as Map);
+
+  Future<List<Map<String, dynamic>>> adminApplications() async {
     final j = await _rpc('dlj_admin_seller_applications');
-    return (j as List).map((e) => Map<String,dynamic>.from(e as Map)).toList();
+    return (j as List).map((e) => Map<String, dynamic>.from(e as Map)).toList();
   }
 
-  Future<List<Map<String,dynamic>>> adminMarketplaceProducts() async {
-    final j = await _rpc('admin_list_products');
-    return (j as List).map((e) => Map<String,dynamic>.from(e as Map)).toList();
-  }
+  Future<Map<String, dynamic>> adminOverview() async =>
+      Map<String, dynamic>.from(await _rpc('dlj_admin_overview') as Map);
 
-  Future<void> adminReviewSeller(String id, String decision, [String note = '']) =>
-      _rpc('dlj_admin_review_seller', {'p_application_id': id,
-        'p_decision': decision, 'p_note': note});
+  Future<void> adminReviewSeller(String applicationId, String decision, String note) =>
+      _rpc('dlj_admin_review_seller',
+          {'p_application_id': applicationId, 'p_decision': decision, 'p_note': note});
 
-  Future<void> adminReviewProduct(String id, String decision, [String note = '']) =>
-      _rpc('dlj_admin_review_product', {'p_product_id': id,
-        'p_decision': decision, 'p_note': note});
+  Future<void> adminSuspendSeller(String userId, bool suspend) =>
+      _rpc('dlj_admin_suspend_seller', {'p_user': userId, 'p_suspend': suspend});
+
+  Future<void> adminReviewProduct(String productId, String decision, String note) =>
+      _rpc('dlj_admin_review_product',
+          {'p_product_id': productId, 'p_decision': decision, 'p_note': note});
 
   Future<void> adminSetCommission(double rate) =>
       _rpc('dlj_admin_set_commission', {'p_rate': rate});
 
-  // ─────────── Administración clásica ───────────
+  Future<void> adminSetSellerCommission(String userId, double rate) =>
+      _rpc('dlj_admin_set_seller_commission', {'p_user': userId, 'p_rate': rate});
+
+  Future<void> adminRecordPayout(
+          String sellerId, String currency, double amount, String reference, String note) =>
+      _rpc('dlj_admin_record_payout', {
+        'p_seller': sellerId,
+        'p_currency': currency,
+        'p_amount': amount,
+        'p_reference': reference,
+        'p_note': note,
+      });
+
+  // ─────────── Vendedor / administrador ───────────
 
   Future<List<OrderRecord>> adminOrders() async {
     final j = await _rpc('admin_orders');
@@ -415,12 +488,12 @@ class Api {
       });
 
   /// Sube una foto al almacenamiento del servidor y devuelve su URL pública.
-  Future<String> uploadImage(File file) async {
+  Future<String> uploadImage(File file, {String folder = ''}) async {
     final bytes = await file.readAsBytes();
     final lower = file.path.toLowerCase();
     final ext = lower.endsWith('.png') ? 'png' : (lower.endsWith('.webp') ? 'webp' : 'jpg');
     final mime = ext == 'png' ? 'image/png' : (ext == 'webp' ? 'image/webp' : 'image/jpeg');
-    final name = 'p_${DateTime.now().millisecondsSinceEpoch}.$ext';
+    final name = '${folder.isEmpty ? '' : '$folder/'}p_${DateTime.now().millisecondsSinceEpoch}.$ext';
     await _send(() => _c.post(
           _u('/storage/v1/object/product-images/$name'),
           headers: {
@@ -622,6 +695,11 @@ class Product {
   final String badge;
   final bool featured;
   final bool active;
+  final String sellerId;
+  final String sellerName;
+  final String publicationStatus; // pending | approved | rejected | suspended
+  final String rejectionNote;
+  final double commissionRate;
 
   const Product({
     required this.id,
@@ -639,6 +717,11 @@ class Product {
     this.badge = '',
     this.featured = false,
     this.active = true,
+    this.sellerId = '',
+    this.sellerName = '',
+    this.publicationStatus = 'approved',
+    this.rejectionNote = '',
+    this.commissionRate = 0,
   });
 
   double priceIn(Cur c) => switch (c) {
@@ -663,6 +746,11 @@ class Product {
         'badge': badge,
         'featured': featured,
         'active': active,
+        'sellerId': sellerId,
+        'sellerName': sellerName,
+        'publicationStatus': publicationStatus,
+        'rejectionNote': rejectionNote,
+        'commissionRate': commissionRate,
       };
 
   factory Product.fromJson(Map<String, dynamic> j) => Product(
@@ -684,6 +772,11 @@ class Product {
         badge: (j['badge'] as String?) ?? '',
         featured: (j['featured'] as bool?) ?? false,
         active: (j['active'] as bool?) ?? true,
+        sellerId: (j['sellerId'] as String?) ?? '',
+        sellerName: (j['sellerName'] as String?) ?? '',
+        publicationStatus: (j['publicationStatus'] as String?) ?? 'approved',
+        rejectionNote: (j['rejectionNote'] as String?) ?? '',
+        commissionRate: (j['commissionRate'] as num?)?.toDouble() ?? 0,
       );
 }
 
@@ -1047,34 +1140,29 @@ class AccountPage extends StatelessWidget {
         ),
         const SectionTitle('Ajustes'),
         _Tile(
-          icon: Icons.storefront_rounded,
-          title: 'Acceso de vendedor',
-          subtitle: 'Solicitar ser vendedor, publicar productos y ver tus ventas',
-          trailing: const Icon(Icons.chevron_right_rounded),
-          onTap: () => Navigator.of(context).push(MaterialPageRoute(builder: (_) => const SellerGate())),
-        ),
-        _Tile(
-          icon: Icons.admin_panel_settings_rounded,
-          title: 'Acceso administrador',
-          subtitle: store.pendingCount > 0
-              ? '${store.pendingCount} pedido(s) por verificar · Aprobar vendedores'
-              : 'Aprobar vendedores, productos, pedidos y comisión',
+          icon: store.remote ? Icons.storefront_rounded : Icons.admin_panel_settings_rounded,
+          title: store.remote ? 'Vender en D.L.J Store' : 'Acceso de vendedor',
+          subtitle: store.remote
+              ? (store.role == 'admin' && store.pendingCount > 0
+                  ? '${store.pendingCount} pedido(s) por verificar'
+                  : 'Regístrate, publica tus apps y productos, fija tus precios y gana dinero')
+              : (store.pendingCount > 0
+                  ? '${store.pendingCount} pedido(s) por verificar'
+                  : 'Catálogo, pedidos, tarjetas de cobro y wallets'),
           trailing: store.pendingCount > 0
               ? Badge(label: Text('${store.pendingCount}'))
               : const Icon(Icons.chevron_right_rounded),
-          onTap: () => Navigator.of(context).push(MaterialPageRoute(builder: (_) => const SellerGate(adminEntry: true))),
+          onTap: () => Navigator.of(context).push(MaterialPageRoute(builder: (_) => const SellerGate())),
         ),
         const SectionTitle('Información'),
         _Tile(
           icon: Icons.info_rounded,
           title: 'HANDMADE D.L.J STORE',
-          subtitle: 'Versión 2.2 · Apps, juegos, arte, pintura, escultura y artesanías',
+          subtitle: 'Versión 3.0 · Apps, juegos, arte, pintura, escultura y artesanías',
           trailing: const SizedBox.shrink(),
           onTap: () async {
-            final revealed = await store.revealAdminEntry();
-            if (revealed && context.mounted) {
-              toast(context, 'Acceso administrador activado en este teléfono');
-            }
+            final revealed = await store.aboutTap();
+            if (revealed && context.mounted) toast(context, 'Modo vendedor activado');
           },
         ),
         const SizedBox(height: 30),
@@ -2028,7 +2116,1334 @@ class ProductCard extends StatelessWidget {
   }
 }
 DLJ_EOF_7
-cat > 'lib/screens/order_success_page.dart' <<'DLJ_EOF_8'
+cat > 'lib/screens/marketplace_pages.dart' <<'DLJ_EOF_8'
+import 'package:flutter/material.dart';
+
+import '../data/api.dart';
+import '../models/models.dart';
+import '../state/app_store.dart';
+import '../theme/app_theme.dart';
+import '../utils/helpers.dart';
+import '../widgets/common.dart';
+import 'seller_pages.dart';
+
+double _n(dynamic v) => v == null ? 0 : (double.tryParse(v.toString()) ?? 0);
+String _t(dynamic v) => v == null ? '' : v.toString();
+
+String _amount(double v, String cur) => '${moneyPlain(v, cur == 'CUP' ? 0 : 2)} $cur';
+
+/// Moneda en la que se cobra un pedido según su método de pago.
+String _curOfMethod(String method) {
+  switch (method) {
+    case 'transfermovilCup':
+      return 'CUP';
+    case 'transfermovilMlc':
+      return 'MLC';
+    default:
+      return 'USDT';
+  }
+}
+
+Future<void> _run(BuildContext context, Future<void> Function() action, {String? ok}) async {
+  try {
+    await action();
+    if (ok != null && context.mounted) toast(context, ok);
+  } on ApiException catch (e) {
+    if (context.mounted) toast(context, e.message);
+  }
+}
+
+Future<String?> _askNote(BuildContext context, String title, {bool required = false}) async {
+  final ctrl = TextEditingController();
+  String? err;
+  final result = await showDialog<String>(
+    context: context,
+    builder: (ctx) => StatefulBuilder(
+      builder: (ctx, setD) => AlertDialog(
+        title: Text(title),
+        content: TextField(
+          controller: ctrl,
+          maxLines: 3,
+          decoration: fieldDec(required ? 'Motivo (obligatorio)' : 'Nota (opcional)')
+              .copyWith(errorText: err),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancelar')),
+          FilledButton(
+            style: FilledButton.styleFrom(minimumSize: const Size(110, 44)),
+            onPressed: () {
+              if (required && ctrl.text.trim().isEmpty) {
+                setD(() => err = 'Escribe el motivo');
+                return;
+              }
+              Navigator.pop(ctx, ctrl.text.trim());
+            },
+            child: const Text('Confirmar'),
+          ),
+        ],
+      ),
+    ),
+  );
+  return result;
+}
+
+// ───────────────────────── Entrar o crear cuenta ─────────────────────────
+
+class AuthScreen extends StatefulWidget {
+  const AuthScreen({super.key});
+  @override
+  State<AuthScreen> createState() => _AuthScreenState();
+}
+
+class _AuthScreenState extends State<AuthScreen> {
+  final name = TextEditingController();
+  final email = TextEditingController();
+  final pass = TextEditingController();
+  bool register = false;
+  bool hide = true;
+  bool busy = false;
+  String? error;
+  String? info;
+
+  @override
+  void dispose() {
+    name.dispose();
+    email.dispose();
+    pass.dispose();
+    super.dispose();
+  }
+
+  Future<void> _submit(AppStore store) async {
+    final e = email.text.trim();
+    if (!e.contains('@') || !e.contains('.')) {
+      setState(() => error = 'Escribe un correo válido');
+      return;
+    }
+    if (pass.text.length < 6) {
+      setState(() => error = 'La contraseña debe tener al menos 6 caracteres');
+      return;
+    }
+    if (register && name.text.trim().length < 2) {
+      setState(() => error = 'Escribe tu nombre');
+      return;
+    }
+    setState(() {
+      busy = true;
+      error = null;
+      info = null;
+    });
+    try {
+      if (register) {
+        final logged = await store.accountSignUp(e, pass.text, name.text);
+        if (!logged && mounted) {
+          setState(() {
+            register = false;
+            info = 'Cuenta creada. Revisa tu correo para confirmarla y luego entra aquí.';
+          });
+        }
+      } else {
+        await store.sellerLogin(e, pass.text);
+      }
+    } on ApiException catch (ex) {
+      if (mounted) setState(() => error = ex.message);
+    }
+    if (mounted) setState(() => busy = false);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final store = AppScope.of(context);
+    return Scaffold(
+      appBar: AppBar(title: Text(register ? 'Crear cuenta' : 'Entrar')),
+      body: ListView(
+        padding: const EdgeInsets.fromLTRB(24, 16, 24, 30),
+        children: [
+          const Center(child: BrandLogo(size: 84)),
+          const SizedBox(height: 18),
+          Text(register ? 'Únete a D.L.J STORE' : 'Bienvenido de nuevo',
+              textAlign: TextAlign.center,
+              style: const TextStyle(fontSize: 22, fontWeight: FontWeight.w800)),
+          const SizedBox(height: 6),
+          const Text(
+            'Con tu cuenta puedes vender tus apps, juegos y creaciones, o administrar la tienda.',
+            textAlign: TextAlign.center,
+            style: TextStyle(color: Palette.muted, height: 1.4),
+          ),
+          const SizedBox(height: 24),
+          if (register) ...[
+            TextField(
+              controller: name,
+              textCapitalization: TextCapitalization.words,
+              decoration: fieldDec('Tu nombre', icon: Icons.person_outline_rounded),
+            ),
+            const SizedBox(height: 12),
+          ],
+          TextField(
+            controller: email,
+            keyboardType: TextInputType.emailAddress,
+            autocorrect: false,
+            decoration: fieldDec('Correo', icon: Icons.alternate_email_rounded),
+          ),
+          const SizedBox(height: 12),
+          TextField(
+            controller: pass,
+            obscureText: hide,
+            decoration: fieldDec('Contraseña', icon: Icons.lock_outline_rounded).copyWith(
+              suffixIcon: IconButton(
+                icon: Icon(hide ? Icons.visibility_rounded : Icons.visibility_off_rounded),
+                onPressed: () => setState(() => hide = !hide),
+              ),
+            ),
+            onSubmitted: (_) => _submit(store),
+          ),
+          if (info != null) ...[
+            const SizedBox(height: 10),
+            Text(info!,
+                textAlign: TextAlign.center,
+                style: const TextStyle(color: Palette.ok, fontWeight: FontWeight.w700, height: 1.35)),
+          ],
+          if (error != null) ...[
+            const SizedBox(height: 10),
+            Text(error!,
+                textAlign: TextAlign.center,
+                style: const TextStyle(color: Palette.danger, fontWeight: FontWeight.w700)),
+          ],
+          const SizedBox(height: 20),
+          CoralButton(
+            label: busy ? 'Un momento…' : (register ? 'Crear cuenta' : 'Entrar'),
+            icon: register ? Icons.person_add_alt_1_rounded : Icons.lock_open_rounded,
+            onPressed: busy ? null : () => _submit(store),
+          ),
+          const SizedBox(height: 10),
+          TextButton(
+            onPressed: busy
+                ? null
+                : () => setState(() {
+                      register = !register;
+                      error = null;
+                      info = null;
+                    }),
+            child: Text(register ? '¿Ya tienes cuenta? Entrar' : '¿No tienes cuenta? Crear una'),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+// ───────────────────────── Área del vendedor ─────────────────────────
+
+class SellerAreaPage extends StatelessWidget {
+  const SellerAreaPage({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    final store = AppScope.of(context);
+    final status = store.sellerStatus;
+    Widget body;
+    if (status == 'approved') {
+      body = const _SellerDash();
+    } else if (status == 'pending') {
+      body = const _InfoCard(
+        icon: Icons.hourglass_top_rounded,
+        color: Palette.warn,
+        title: 'Solicitud en revisión',
+        text: 'Estamos revisando tu solicitud de vendedor. Te avisaremos cuando esté aprobada. '
+            'Entra de nuevo más tarde para ver el estado.',
+      );
+    } else if (status == 'suspended') {
+      body = const _InfoCard(
+        icon: Icons.block_rounded,
+        color: Palette.danger,
+        title: 'Cuenta de vendedor suspendida',
+        text: 'Tus productos están ocultos. Contacta con la tienda para revisar tu caso.',
+      );
+    } else {
+      body = const _ApplyForm();
+    }
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('Mi cuenta de vendedor'),
+        actions: [
+          IconButton(
+            tooltip: 'Actualizar',
+            icon: const Icon(Icons.refresh_rounded),
+            onPressed: () => store.refreshSeller(),
+          ),
+          IconButton(
+            tooltip: 'Cerrar sesión',
+            icon: const Icon(Icons.logout_rounded),
+            onPressed: () {
+              store.lockSeller();
+              Navigator.of(context).pop();
+            },
+          ),
+        ],
+      ),
+      body: body,
+    );
+  }
+}
+
+class _InfoCard extends StatelessWidget {
+  final IconData icon;
+  final Color color;
+  final String title;
+  final String text;
+  const _InfoCard({required this.icon, required this.color, required this.title, required this.text});
+
+  @override
+  Widget build(BuildContext context) {
+    return ListView(
+      padding: const EdgeInsets.all(24),
+      children: [
+        const SizedBox(height: 30),
+        Center(
+          child: Container(
+            width: 84,
+            height: 84,
+            decoration: BoxDecoration(color: color.withOpacity(0.12), shape: BoxShape.circle),
+            child: Icon(icon, color: color, size: 40),
+          ),
+        ),
+        const SizedBox(height: 18),
+        Text(title,
+            textAlign: TextAlign.center,
+            style: const TextStyle(fontSize: 20, fontWeight: FontWeight.w800)),
+        const SizedBox(height: 8),
+        Text(text,
+            textAlign: TextAlign.center, style: const TextStyle(color: Palette.muted, height: 1.45)),
+      ],
+    );
+  }
+}
+
+class _ApplyForm extends StatefulWidget {
+  const _ApplyForm();
+  @override
+  State<_ApplyForm> createState() => _ApplyFormState();
+}
+
+class _ApplyFormState extends State<_ApplyForm> {
+  final business = TextEditingController();
+  final description = TextEditingController();
+  final phone = TextEditingController();
+  bool accept = false;
+  bool busy = false;
+  bool _init = false;
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    if (_init) return;
+    _init = true;
+    final p = AppScope.of(context).sellerProfile;
+    business.text = _t(p['display_name']);
+    phone.text = _t(p['phone']);
+  }
+
+  @override
+  void dispose() {
+    business.dispose();
+    description.dispose();
+    phone.dispose();
+    super.dispose();
+  }
+
+  Future<void> _send(AppStore store) async {
+    if (business.text.trim().length < 2) {
+      toast(context, 'Escribe el nombre de tu negocio');
+      return;
+    }
+    if (!accept) {
+      toast(context, 'Debes aceptar las condiciones');
+      return;
+    }
+    setState(() => busy = true);
+    await _run(context, () => store.applyAsSeller(business.text, description.text, phone.text),
+        ok: 'Solicitud enviada');
+    if (mounted) setState(() => busy = false);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final store = AppScope.of(context);
+    final rejected = store.sellerStatus == 'rejected';
+    return ListView(
+      padding: const EdgeInsets.fromLTRB(20, 8, 20, 30),
+      children: [
+        if (rejected)
+          Container(
+            margin: const EdgeInsets.only(bottom: 14),
+            padding: const EdgeInsets.all(14),
+            decoration: BoxDecoration(
+              color: Palette.danger.withOpacity(0.08),
+              borderRadius: BorderRadius.circular(16),
+            ),
+            child: const Text('Tu solicitud anterior no fue aprobada. Puedes enviar otra corrigiendo los datos.',
+                style: TextStyle(height: 1.4)),
+          ),
+        Container(
+          padding: const EdgeInsets.all(20),
+          decoration: BoxDecoration(
+            gradient: Palette.hero,
+            borderRadius: BorderRadius.circular(24),
+          ),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Icon(Icons.storefront_rounded, color: Palette.gold, size: 32),
+              const SizedBox(height: 12),
+              const Text('Vende en D.L.J STORE',
+                  style: TextStyle(color: Colors.white, fontSize: 22, fontWeight: FontWeight.w800)),
+              const SizedBox(height: 6),
+              Text(
+                'Publica tus apps, juegos y creaciones, pon tus precios y gana dinero. '
+                'La tienda se queda con una comisión del ${store.marketCommission.toStringAsFixed(0)}% de cada venta.',
+                style: const TextStyle(color: Colors.white70, height: 1.4),
+              ),
+            ],
+          ),
+        ),
+        const SizedBox(height: 18),
+        TextField(
+            controller: business,
+            decoration: fieldDec('Nombre de tu negocio o marca', icon: Icons.badge_outlined)),
+        const SizedBox(height: 12),
+        TextField(
+            controller: description,
+            maxLines: 3,
+            decoration: fieldDec('¿Qué vas a vender?', icon: Icons.notes_rounded)),
+        const SizedBox(height: 12),
+        TextField(
+            controller: phone,
+            keyboardType: TextInputType.phone,
+            decoration: fieldDec('Teléfono / WhatsApp', icon: Icons.phone_outlined)),
+        const SizedBox(height: 16),
+        SoftCard(
+          padding: const EdgeInsets.all(16),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text('Cómo funciona', style: TextStyle(fontWeight: FontWeight.w800)),
+              const SizedBox(height: 8),
+              ...const [
+                '1. Revisamos tu solicitud antes de activarte.',
+                '2. Cada producto que publiques se revisa antes de aparecer en la tienda.',
+                '3. El cliente paga a D.L.J STORE; cuando el pago se verifica, tu parte (precio menos comisión) se suma a tu saldo.',
+                '4. La tienda te paga tu saldo a la tarjeta o wallet que pongas en tu perfil.',
+                '5. Solo puedes publicar contenido propio o con permiso, sin virus ni software dañino. Tu enlace de descarga debe empezar por https://.',
+              ].map((t) => Padding(
+                    padding: const EdgeInsets.only(bottom: 6),
+                    child: Text(t, style: const TextStyle(color: Palette.muted, height: 1.35, fontSize: 13.5)),
+                  )),
+            ],
+          ),
+        ),
+        CheckboxListTile(
+          contentPadding: EdgeInsets.zero,
+          controlAffinity: ListTileControlAffinity.leading,
+          value: accept,
+          onChanged: (v) => setState(() => accept = v ?? false),
+          title: const Text('Acepto las condiciones y la comisión de la tienda',
+              style: TextStyle(fontWeight: FontWeight.w600, fontSize: 14)),
+        ),
+        const SizedBox(height: 8),
+        CoralButton(
+          label: busy ? 'Enviando…' : 'Enviar solicitud',
+          icon: Icons.send_rounded,
+          onPressed: busy ? null : () => _send(store),
+        ),
+      ],
+    );
+  }
+}
+
+class _SellerDash extends StatelessWidget {
+  const _SellerDash();
+
+  @override
+  Widget build(BuildContext context) {
+    return const DefaultTabController(
+      length: 4,
+      child: Column(
+        children: [
+          TabBar(
+            isScrollable: true,
+            labelColor: Palette.navy,
+            unselectedLabelColor: Palette.muted,
+            indicatorColor: Palette.coral,
+            labelStyle: TextStyle(fontWeight: FontWeight.w800),
+            tabs: [Tab(text: 'Productos'), Tab(text: 'Ventas'), Tab(text: 'Saldo'), Tab(text: 'Perfil')],
+          ),
+          Expanded(
+            child: TabBarView(children: [_MyProductsTab(), _SalesTab(), _BalanceTab(), _ProfileTab()]),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+Widget _pubChip(String status) {
+  switch (status) {
+    case 'approved':
+      return const Pill('Publicado', icon: Icons.check_circle_rounded, color: Palette.ok);
+    case 'rejected':
+      return const Pill('Rechazado', icon: Icons.cancel_rounded, color: Palette.danger);
+    case 'suspended':
+      return const Pill('Suspendido', icon: Icons.block_rounded, color: Palette.danger);
+    default:
+      return const Pill('En revisión', icon: Icons.hourglass_top_rounded, color: Palette.warn);
+  }
+}
+
+class _MyProductsTab extends StatelessWidget {
+  const _MyProductsTab();
+
+  @override
+  Widget build(BuildContext context) {
+    final store = AppScope.of(context);
+    final list = store.mySellerProducts;
+    return RefreshIndicator(
+      color: Palette.coral,
+      onRefresh: store.refreshSeller,
+      child: ListView(
+        physics: const AlwaysScrollableScrollPhysics(),
+        padding: const EdgeInsets.fromLTRB(20, 16, 20, 24),
+        children: [
+          CoralButton(
+            label: 'Nuevo producto',
+            icon: Icons.add_rounded,
+            onPressed: () => Navigator.of(context).push(
+              MaterialPageRoute(builder: (_) => const ProductFormPage(asSeller: true)),
+            ),
+          ),
+          const SizedBox(height: 8),
+          const Text('Cada producto nuevo o editado se revisa antes de aparecer en la tienda.',
+              style: TextStyle(color: Palette.muted, fontSize: 12.5)),
+          const SizedBox(height: 14),
+          if (list.isEmpty)
+            const EmptyState(
+              icon: Icons.inventory_2_outlined,
+              title: 'Aún no has publicado nada',
+              message: 'Sube tu primera app, juego o creación para empezar a vender.',
+            ),
+          for (final p in list)
+            Padding(
+              padding: const EdgeInsets.only(bottom: 12),
+              child: SoftCard(
+                padding: const EdgeInsets.all(12),
+                onTap: () => Navigator.of(context).push(
+                  MaterialPageRoute(builder: (_) => ProductFormPage(product: p, asSeller: true)),
+                ),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      children: [
+                        ClipRRect(
+                          borderRadius: BorderRadius.circular(14),
+                          child: SizedBox(width: 62, height: 62, child: ProductImage(product: p, height: 62)),
+                        ),
+                        const SizedBox(width: 12),
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(p.name,
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: const TextStyle(fontWeight: FontWeight.w800)),
+                              const SizedBox(height: 2),
+                              Text('${p.kind.label} · ${money(p.priceCUP, Cur.cup)}',
+                                  style: const TextStyle(color: Palette.muted, fontSize: 12.5)),
+                              const SizedBox(height: 6),
+                              _pubChip(p.publicationStatus),
+                            ],
+                          ),
+                        ),
+                        IconButton(
+                          tooltip: 'Eliminar',
+                          icon: const Icon(Icons.delete_outline_rounded, color: Palette.danger),
+                          onPressed: () async {
+                            final ok = await showDialog<bool>(
+                              context: context,
+                              builder: (ctx) => AlertDialog(
+                                title: const Text('Eliminar producto'),
+                                content: Text('¿Eliminar «${p.name}»?'),
+                                actions: [
+                                  TextButton(
+                                      onPressed: () => Navigator.pop(ctx, false),
+                                      child: const Text('Cancelar')),
+                                  TextButton(
+                                      onPressed: () => Navigator.pop(ctx, true),
+                                      child: const Text('Eliminar',
+                                          style: TextStyle(color: Palette.danger))),
+                                ],
+                              ),
+                            );
+                            if (ok == true && context.mounted) {
+                              await _run(context, () => store.sellerDeleteProduct(p.id));
+                            }
+                          },
+                        ),
+                      ],
+                    ),
+                    if (p.publicationStatus == 'rejected' && p.rejectionNote.isNotEmpty) ...[
+                      const SizedBox(height: 8),
+                      Text('Motivo: ${p.rejectionNote}',
+                          style: const TextStyle(color: Palette.danger, fontSize: 12.5, height: 1.3)),
+                    ],
+                  ],
+                ),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+}
+
+class _SalesTab extends StatelessWidget {
+  const _SalesTab();
+
+  @override
+  Widget build(BuildContext context) {
+    final store = AppScope.of(context);
+    final sales = store.sellerSales;
+    return RefreshIndicator(
+      color: Palette.coral,
+      onRefresh: store.refreshSeller,
+      child: sales.isEmpty
+          ? ListView(
+              physics: const AlwaysScrollableScrollPhysics(),
+              children: const [
+                SizedBox(height: 40),
+                EmptyState(
+                  icon: Icons.receipt_long_outlined,
+                  title: 'Todavía no tienes ventas',
+                  message: 'Cuando alguien compre tus productos y el pago se verifique, aparecerán aquí.',
+                ),
+              ],
+            )
+          : ListView.separated(
+              physics: const AlwaysScrollableScrollPhysics(),
+              padding: const EdgeInsets.fromLTRB(20, 16, 20, 24),
+              itemCount: sales.length,
+              separatorBuilder: (_, __) => const SizedBox(height: 12),
+              itemBuilder: (_, i) {
+                final o = sales[i];
+                final method = _t(o['method']);
+                final cur = _curOfMethod(method);
+                final status = OrderStatus.values.firstWhere(
+                  (e) => e.name == _t(o['status']),
+                  orElse: () => OrderStatus.pending,
+                );
+                final items = (o['items'] as List? ?? []).map((e) => Map<String, dynamic>.from(e as Map)).toList();
+                final created = DateTime.tryParse(_t(o['created_at']))?.toLocal();
+                return SoftCard(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Row(
+                        children: [
+                          Expanded(
+                            child: Text(_t(o['code']),
+                                style: const TextStyle(fontWeight: FontWeight.w900, fontSize: 16)),
+                          ),
+                          StatusChip(status),
+                        ],
+                      ),
+                      if (created != null)
+                        Text(formatDate(created), style: const TextStyle(color: Palette.muted, fontSize: 12.5)),
+                      const SizedBox(height: 10),
+                      for (final it in items)
+                        Padding(
+                          padding: const EdgeInsets.only(bottom: 6),
+                          child: Row(
+                            children: [
+                              Expanded(
+                                child: Text('${_t(it['name'])}  ×${_t(it['qty'])}',
+                                    style: const TextStyle(fontWeight: FontWeight.w600)),
+                              ),
+                              Text(
+                                _amount(
+                                    _n(it[cur == 'CUP'
+                                        ? 'seller_total_cup'
+                                        : (cur == 'MLC' ? 'seller_total_mlc' : 'seller_total_usdt')]),
+                                    cur),
+                                style: const TextStyle(fontWeight: FontWeight.w800),
+                              ),
+                            ],
+                          ),
+                        ),
+                      const Text('Tu parte, ya descontada la comisión.',
+                          style: TextStyle(color: Palette.muted, fontSize: 12)),
+                      if (_t(o['customer_name']).isNotEmpty) ...[
+                        const SizedBox(height: 8),
+                        Text('${_t(o['customer_name'])} · ${_t(o['phone'])}',
+                            style: const TextStyle(fontWeight: FontWeight.w700, fontSize: 13)),
+                        if (_t(o['address']).isNotEmpty)
+                          Text(_t(o['address']), style: const TextStyle(color: Palette.muted, fontSize: 12.5)),
+                      ],
+                    ],
+                  ),
+                );
+              },
+            ),
+    );
+  }
+}
+
+class _BalanceTab extends StatelessWidget {
+  const _BalanceTab();
+
+  @override
+  Widget build(BuildContext context) {
+    final store = AppScope.of(context);
+    final data = store.sellerBalanceData;
+    final bal = data['balance'] is Map ? Map<String, dynamic>.from(data['balance'] as Map) : <String, dynamic>{};
+    final payouts =
+        (data['payouts'] as List? ?? []).map((e) => Map<String, dynamic>.from(e as Map)).toList();
+    return RefreshIndicator(
+      color: Palette.coral,
+      onRefresh: store.refreshSeller,
+      child: ListView(
+        physics: const AlwaysScrollableScrollPhysics(),
+        padding: const EdgeInsets.fromLTRB(20, 16, 20, 24),
+        children: [
+          for (final cur in const ['CUP', 'MLC', 'USDT'])
+            Padding(
+              padding: const EdgeInsets.only(bottom: 12),
+              child: _BalanceCard(cur: cur, b: bal[cur] is Map ? Map<String, dynamic>.from(bal[cur] as Map) : {}),
+            ),
+          const Text(
+            'Solo cuentan los pedidos con pago verificado. USDT incluye lo cobrado en USDT, TRX y Bitcoin '
+            '(en USDT equivalentes). La tienda te paga el saldo a la tarjeta o wallet de tu perfil.',
+            style: TextStyle(color: Palette.muted, fontSize: 12.5, height: 1.4),
+          ),
+          const SizedBox(height: 18),
+          const Text('Pagos recibidos', style: TextStyle(fontSize: 17, fontWeight: FontWeight.w800)),
+          const SizedBox(height: 10),
+          if (payouts.isEmpty)
+            const Text('Aún no te han pagado ninguna liquidación.', style: TextStyle(color: Palette.muted)),
+          for (final p in payouts)
+            Padding(
+              padding: const EdgeInsets.only(bottom: 8),
+              child: SoftCard(
+                padding: const EdgeInsets.all(14),
+                child: Row(
+                  children: [
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(_amount(_n(p['amount']), _t(p['currency'])),
+                              style: const TextStyle(fontWeight: FontWeight.w900)),
+                          if (_t(p['reference']).isNotEmpty)
+                            Text('Ref: ${_t(p['reference'])}',
+                                style: const TextStyle(color: Palette.muted, fontSize: 12.5)),
+                        ],
+                      ),
+                    ),
+                    Text(
+                      formatDate(DateTime.tryParse(_t(p['created_at']))?.toLocal() ?? DateTime.now()),
+                      style: const TextStyle(color: Palette.muted, fontSize: 12),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+}
+
+class _BalanceCard extends StatelessWidget {
+  final String cur;
+  final Map<String, dynamic> b;
+  const _BalanceCard({required this.cur, required this.b});
+
+  @override
+  Widget build(BuildContext context) {
+    final due = _n(b['due']);
+    return SoftCard(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Pill(cur, icon: Icons.account_balance_wallet_rounded),
+              const Spacer(),
+              const Text('Por cobrar', style: TextStyle(color: Palette.muted, fontWeight: FontWeight.w700)),
+            ],
+          ),
+          const SizedBox(height: 8),
+          Text(_amount(due, cur),
+              style: TextStyle(
+                  fontSize: 26,
+                  fontWeight: FontWeight.w900,
+                  color: due > 0 ? Palette.ok : Palette.ink)),
+          const SizedBox(height: 8),
+          Text(
+            'Ganado ${_amount(_n(b['earned']), cur)} · Pagado ${_amount(_n(b['paid']), cur)} · '
+            'Comisión tienda ${_amount(_n(b['commission']), cur)}',
+            style: const TextStyle(color: Palette.muted, fontSize: 12.5, height: 1.4),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _ProfileTab extends StatefulWidget {
+  const _ProfileTab();
+  @override
+  State<_ProfileTab> createState() => _ProfileTabState();
+}
+
+class _ProfileTabState extends State<_ProfileTab> {
+  final name = TextEditingController();
+  final phone = TextEditingController();
+  final cup = TextEditingController();
+  final mlc = TextEditingController();
+  final wallet = TextEditingController();
+  bool busy = false;
+  bool _init = false;
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    if (_init) return;
+    _init = true;
+    final p = AppScope.of(context).sellerProfile;
+    name.text = _t(p['display_name']);
+    phone.text = _t(p['phone']);
+    cup.text = formatCard(_t(p['payout_card_cup']));
+    mlc.text = formatCard(_t(p['payout_card_mlc']));
+    wallet.text = _t(p['payout_wallet']);
+  }
+
+  @override
+  void dispose() {
+    for (final c in [name, phone, cup, mlc, wallet]) {
+      c.dispose();
+    }
+    super.dispose();
+  }
+
+  Future<void> _save(AppStore store) async {
+    final c = onlyDigits(cup.text);
+    final m = onlyDigits(mlc.text);
+    if ((c.isNotEmpty && c.length != 16) || (m.isNotEmpty && m.length != 16)) {
+      toast(context, 'Las tarjetas deben tener 16 dígitos');
+      return;
+    }
+    final w = wallet.text.trim();
+    if (w.isNotEmpty && !isValidTronAddress(w) && !isValidBtcAddress(w)) {
+      toast(context, 'La wallet debe ser una dirección TRON (T…) o Bitcoin válida');
+      return;
+    }
+    setState(() => busy = true);
+    await _run(
+      context,
+      () => store.saveSellerProfile({
+        'display_name': name.text.trim(),
+        'phone': phone.text.trim(),
+        'payout_card_cup': c,
+        'payout_card_mlc': m,
+        'payout_wallet': w,
+      }),
+      ok: 'Perfil guardado',
+    );
+    if (mounted) setState(() => busy = false);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final store = AppScope.of(context);
+    return ListView(
+      padding: const EdgeInsets.fromLTRB(20, 16, 20, 30),
+      children: [
+        const Text('Datos para cobrar', style: TextStyle(fontSize: 17, fontWeight: FontWeight.w800)),
+        const SizedBox(height: 4),
+        const Text('La tienda te pagará tu saldo aquí. Revisa bien los números.',
+            style: TextStyle(color: Palette.muted, fontSize: 12.5)),
+        const SizedBox(height: 12),
+        TextField(controller: name, decoration: fieldDec('Nombre de tu negocio', icon: Icons.badge_outlined)),
+        const SizedBox(height: 12),
+        TextField(
+            controller: phone,
+            keyboardType: TextInputType.phone,
+            decoration: fieldDec('Teléfono / WhatsApp', icon: Icons.phone_outlined)),
+        const SizedBox(height: 12),
+        TextField(
+            controller: cup,
+            keyboardType: TextInputType.number,
+            decoration: fieldDec('Tarjeta CUP (16 dígitos)', icon: Icons.credit_card_rounded)),
+        const SizedBox(height: 12),
+        TextField(
+            controller: mlc,
+            keyboardType: TextInputType.number,
+            decoration: fieldDec('Tarjeta MLC (16 dígitos)', icon: Icons.credit_card_rounded)),
+        const SizedBox(height: 12),
+        TextField(
+            controller: wallet,
+            decoration: fieldDec('Wallet USDT TRC20 o Bitcoin (opcional)',
+                icon: Icons.account_balance_wallet_rounded)),
+        const SizedBox(height: 20),
+        CoralButton(
+          label: busy ? 'Guardando…' : 'Guardar perfil',
+          icon: Icons.check_rounded,
+          onPressed: busy ? null : () => _save(store),
+        ),
+      ],
+    );
+  }
+}
+
+// ───────────────────────── Administración del marketplace ─────────────────────────
+
+class AdminMarketTab extends StatefulWidget {
+  const AdminMarketTab({super.key});
+  @override
+  State<AdminMarketTab> createState() => _AdminMarketTabState();
+}
+
+class _AdminMarketTabState extends State<AdminMarketTab> {
+  final commission = TextEditingController();
+  bool _init = false;
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    if (_init) return;
+    _init = true;
+    commission.text = AppScope.of(context).marketCommission.toStringAsFixed(0);
+  }
+
+  @override
+  void dispose() {
+    commission.dispose();
+    super.dispose();
+  }
+
+  Future<void> _payout(BuildContext context, AppStore store, Map<String, dynamic> s) async {
+    final amount = TextEditingController();
+    final ref = TextEditingController();
+    var cur = 'CUP';
+    final bal = s['balance'] is Map ? Map<String, dynamic>.from(s['balance'] as Map) : <String, dynamic>{};
+    String? err;
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setD) {
+          final due = bal[cur] is Map ? _n((bal[cur] as Map)['due']) : 0.0;
+          return AlertDialog(
+            title: Text('Pagar a ${_t(s['display_name'])}'),
+            content: SingleChildScrollView(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  DropdownButtonFormField<String>(
+                    value: cur,
+                    decoration: fieldDec('Moneda'),
+                    items: const [
+                      DropdownMenuItem(value: 'CUP', child: Text('CUP')),
+                      DropdownMenuItem(value: 'MLC', child: Text('MLC')),
+                      DropdownMenuItem(value: 'USDT', child: Text('USDT')),
+                    ],
+                    onChanged: (v) => setD(() => cur = v ?? cur),
+                  ),
+                  const SizedBox(height: 8),
+                  Align(
+                    alignment: Alignment.centerLeft,
+                    child: Text('Saldo pendiente: ${_amount(due, cur)}',
+                        style: const TextStyle(color: Palette.muted, fontSize: 12.5)),
+                  ),
+                  const SizedBox(height: 8),
+                  TextField(
+                    controller: amount,
+                    keyboardType: const TextInputType.numberWithOptions(decimal: true),
+                    decoration: fieldDec('Monto pagado').copyWith(errorText: err),
+                  ),
+                  const SizedBox(height: 10),
+                  TextField(controller: ref, decoration: fieldDec('Referencia de la transferencia')),
+                ],
+              ),
+            ),
+            actions: [
+              TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancelar')),
+              FilledButton(
+                style: FilledButton.styleFrom(minimumSize: const Size(110, 44)),
+                onPressed: () {
+                  final v = double.tryParse(amount.text.trim().replaceAll(',', '.'));
+                  if (v == null || v <= 0) {
+                    setD(() => err = 'Monto no válido');
+                    return;
+                  }
+                  Navigator.pop(ctx, true);
+                },
+                child: const Text('Registrar'),
+              ),
+            ],
+          );
+        },
+      ),
+    );
+    if (ok == true && context.mounted) {
+      final v = double.parse(amount.text.trim().replaceAll(',', '.'));
+      await _run(context, () => store.recordPayout(_t(s['user_id']), cur, v, ref.text.trim(), ''),
+          ok: 'Pago registrado');
+    }
+  }
+
+  Future<void> _setCommission(BuildContext context, AppStore store, Map<String, dynamic> s) async {
+    final ctrl = TextEditingController(text: _t(s['commission']).isEmpty ? '10' : _n(s['commission']).toStringAsFixed(0));
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text('Comisión de ${_t(s['display_name'])}'),
+        content: TextField(
+          controller: ctrl,
+          keyboardType: const TextInputType.numberWithOptions(decimal: true),
+          decoration: fieldDec('Porcentaje (0 a 100)'),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancelar')),
+          FilledButton(
+              style: FilledButton.styleFrom(minimumSize: const Size(110, 44)),
+              onPressed: () => Navigator.pop(ctx, true),
+              child: const Text('Guardar')),
+        ],
+      ),
+    );
+    final v = double.tryParse(ctrl.text.trim().replaceAll(',', '.'));
+    if (ok == true && v != null && context.mounted) {
+      await _run(context, () => store.setSellerCommission(_t(s['user_id']), v),
+          ok: 'Comisión actualizada (aplica a ventas futuras)');
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final store = AppScope.of(context);
+    final pendingApps =
+        store.adminApplicationList.where((a) => _t(a['status']) == 'pending').toList();
+    final pendingProducts =
+        store.adminProducts.where((p) => p.sellerId.isNotEmpty && p.publicationStatus == 'pending').toList();
+    final ov = store.adminOverviewData;
+    final totals = ov['totals'] is Map ? Map<String, dynamic>.from(ov['totals'] as Map) : <String, dynamic>{};
+    final sellers =
+        (ov['sellers'] as List? ?? []).map((e) => Map<String, dynamic>.from(e as Map)).toList();
+
+    return RefreshIndicator(
+      color: Palette.coral,
+      onRefresh: store.refreshSeller,
+      child: ListView(
+        physics: const AlwaysScrollableScrollPhysics(),
+        padding: const EdgeInsets.fromLTRB(20, 16, 20, 30),
+        children: [
+          // Resumen
+          const Text('Resumen del marketplace', style: TextStyle(fontSize: 17, fontWeight: FontWeight.w800)),
+          const SizedBox(height: 10),
+          for (final cur in const ['CUP', 'MLC', 'USDT'])
+            Builder(builder: (_) {
+              final t = totals[cur] is Map ? Map<String, dynamic>.from(totals[cur] as Map) : <String, dynamic>{};
+              return Padding(
+                padding: const EdgeInsets.only(bottom: 8),
+                child: SoftCard(
+                  padding: const EdgeInsets.all(14),
+                  child: Row(
+                    children: [
+                      Pill(cur, icon: Icons.paid_rounded),
+                      const SizedBox(width: 12),
+                      Expanded(
+                        child: Text(
+                          'Tu comisión ${_amount(_n(t['commission']), cur)}\\nPor pagar a vendedores ${_amount(_n(t['due']), cur)}',
+                          style: const TextStyle(fontWeight: FontWeight.w700, height: 1.4, fontSize: 13),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              );
+            }),
+          const SizedBox(height: 10),
+          Row(
+            children: [
+              Expanded(
+                child: TextField(
+                  controller: commission,
+                  keyboardType: const TextInputType.numberWithOptions(decimal: true),
+                  decoration: fieldDec('Comisión para vendedores nuevos (%)'),
+                ),
+              ),
+              const SizedBox(width: 10),
+              SizedBox(
+                width: 110,
+                child: FilledButton(
+                  onPressed: () {
+                    final v = double.tryParse(commission.text.trim().replaceAll(',', '.'));
+                    if (v == null || v < 0 || v > 100) {
+                      toast(context, 'Escribe un porcentaje entre 0 y 100');
+                      return;
+                    }
+                    _run(context, () => store.setDefaultCommission(v), ok: 'Comisión guardada');
+                  },
+                  child: const Text('Guardar'),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 6),
+          const Text('Cambia solo los productos que se publiquen desde ahora.',
+              style: TextStyle(color: Palette.muted, fontSize: 12)),
+
+          // Solicitudes
+          const SizedBox(height: 26),
+          Text('Solicitudes de vendedor (${pendingApps.length})',
+              style: const TextStyle(fontSize: 17, fontWeight: FontWeight.w800)),
+          const SizedBox(height: 10),
+          if (pendingApps.isEmpty)
+            const Text('No hay solicitudes pendientes.', style: TextStyle(color: Palette.muted)),
+          for (final a in pendingApps)
+            Padding(
+              padding: const EdgeInsets.only(bottom: 10),
+              child: SoftCard(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(_t(a['business_name']), style: const TextStyle(fontWeight: FontWeight.w900, fontSize: 16)),
+                    Text(_t(a['email']), style: const TextStyle(color: Palette.muted, fontSize: 12.5)),
+                    if (_t(a['contact_phone']).isNotEmpty)
+                      Text(_t(a['contact_phone']), style: const TextStyle(fontSize: 13)),
+                    if (_t(a['description']).isNotEmpty) ...[
+                      const SizedBox(height: 6),
+                      Text(_t(a['description']), style: const TextStyle(height: 1.35, fontSize: 13.5)),
+                    ],
+                    const SizedBox(height: 12),
+                    Row(
+                      children: [
+                        Expanded(
+                          child: OutlinedButton(
+                            style: OutlinedButton.styleFrom(
+                                foregroundColor: Palette.danger, minimumSize: const Size.fromHeight(46)),
+                            onPressed: () async {
+                              final note = await _askNote(context, 'Rechazar solicitud', required: true);
+                              if (note != null && context.mounted) {
+                                await _run(context, () => store.reviewSeller(_t(a['id']), 'rejected', note),
+                                    ok: 'Solicitud rechazada');
+                              }
+                            },
+                            child: const Text('Rechazar'),
+                          ),
+                        ),
+                        const SizedBox(width: 10),
+                        Expanded(
+                          flex: 2,
+                          child: FilledButton(
+                            style: FilledButton.styleFrom(
+                                backgroundColor: Palette.ok, minimumSize: const Size.fromHeight(46)),
+                            onPressed: () => _run(context, () => store.reviewSeller(_t(a['id']), 'approved', ''),
+                                ok: 'Vendedor aprobado'),
+                            child: const Text('Aprobar vendedor'),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ],
+                ),
+              ),
+            ),
+
+          // Productos por revisar
+          const SizedBox(height: 20),
+          Text('Productos por revisar (${pendingProducts.length})',
+              style: const TextStyle(fontSize: 17, fontWeight: FontWeight.w800)),
+          const SizedBox(height: 4),
+          const Text('Antes de aprobar una app, descarga el APK desde el enlace y compruébalo.',
+              style: TextStyle(color: Palette.muted, fontSize: 12.5)),
+          const SizedBox(height: 10),
+          if (pendingProducts.isEmpty)
+            const Text('No hay productos pendientes.', style: TextStyle(color: Palette.muted)),
+          for (final p in pendingProducts)
+            Padding(
+              padding: const EdgeInsets.only(bottom: 10),
+              child: SoftCard(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      children: [
+                        ClipRRect(
+                          borderRadius: BorderRadius.circular(14),
+                          child: SizedBox(width: 62, height: 62, child: ProductImage(product: p, height: 62)),
+                        ),
+                        const SizedBox(width: 12),
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(p.name, style: const TextStyle(fontWeight: FontWeight.w800)),
+                              Text('${p.kind.label} · de ${p.sellerName.isEmpty ? 'vendedor' : p.sellerName}',
+                                  style: const TextStyle(color: Palette.muted, fontSize: 12.5)),
+                              Text('${money(p.priceCUP, Cur.cup)} · ${money(p.priceMLC, Cur.mlc)} · ${money(p.priceUSDT, Cur.usdt)}',
+                                  style: const TextStyle(fontSize: 12)),
+                            ],
+                          ),
+                        ),
+                      ],
+                    ),
+                    if (p.description.isNotEmpty) ...[
+                      const SizedBox(height: 8),
+                      Text(p.description,
+                          maxLines: 4,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(height: 1.35, fontSize: 13)),
+                    ],
+                    if (p.downloadUrl.isNotEmpty) ...[
+                      const SizedBox(height: 8),
+                      CopyRow(label: 'Enlace de descarga', value: p.downloadUrl, mono: false),
+                      const SizedBox(height: 6),
+                      OutlinedButton.icon(
+                        onPressed: () => openUrl(p.downloadUrl),
+                        icon: const Icon(Icons.open_in_new_rounded, size: 17),
+                        label: const Text('Abrir enlace'),
+                      ),
+                    ],
+                    const SizedBox(height: 10),
+                    Row(
+                      children: [
+                        Expanded(
+                          child: OutlinedButton(
+                            style: OutlinedButton.styleFrom(
+                                foregroundColor: Palette.danger, minimumSize: const Size.fromHeight(46)),
+                            onPressed: () async {
+                              final note = await _askNote(context, 'Rechazar producto', required: true);
+                              if (note != null && context.mounted) {
+                                await _run(context, () => store.reviewProduct(p.id, 'rejected', note),
+                                    ok: 'Producto rechazado');
+                              }
+                            },
+                            child: const Text('Rechazar'),
+                          ),
+                        ),
+                        const SizedBox(width: 10),
+                        Expanded(
+                          flex: 2,
+                          child: FilledButton(
+                            style: FilledButton.styleFrom(
+                                backgroundColor: Palette.ok, minimumSize: const Size.fromHeight(46)),
+                            onPressed: () => _run(context, () => store.reviewProduct(p.id, 'approved', ''),
+                                ok: 'Producto publicado'),
+                            child: const Text('Aprobar y publicar'),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ],
+                ),
+              ),
+            ),
+
+          // Vendedores
+          const SizedBox(height: 20),
+          Text('Vendedores (${sellers.length})',
+              style: const TextStyle(fontSize: 17, fontWeight: FontWeight.w800)),
+          const SizedBox(height: 10),
+          if (sellers.isEmpty)
+            const Text('Aún no hay vendedores aprobados.', style: TextStyle(color: Palette.muted)),
+          for (final s in sellers)
+            Padding(
+              padding: const EdgeInsets.only(bottom: 10),
+              child: SoftCard(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      children: [
+                        Expanded(
+                          child: Text(_t(s['display_name']),
+                              style: const TextStyle(fontWeight: FontWeight.w900, fontSize: 16)),
+                        ),
+                        _t(s['seller_status']) == 'suspended'
+                            ? const Pill('Suspendido', color: Palette.danger)
+                            : const Pill('Activo', color: Palette.ok),
+                      ],
+                    ),
+                    Text('${_t(s['email'])} · ${_t(s['products'])} producto(s) · comisión ${_t(s['commission']).isEmpty ? '—' : '${_n(s['commission']).toStringAsFixed(0)}%'}',
+                        style: const TextStyle(color: Palette.muted, fontSize: 12.5)),
+                    const SizedBox(height: 8),
+                    for (final cur in const ['CUP', 'MLC', 'USDT'])
+                      Builder(builder: (_) {
+                        final b = s['balance'] is Map ? Map<String, dynamic>.from(s['balance'] as Map) : <String, dynamic>{};
+                        final c = b[cur] is Map ? Map<String, dynamic>.from(b[cur] as Map) : <String, dynamic>{};
+                        return Text('$cur: por pagar ${_amount(_n(c['due']), cur)} (pagado ${_amount(_n(c['paid']), cur)})',
+                            style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600));
+                      }),
+                    const SizedBox(height: 8),
+                    if (_t(s['payout_card_cup']).isNotEmpty)
+                      CopyRow(label: 'Tarjeta CUP del vendedor', value: onlyDigits(_t(s['payout_card_cup'])), display: formatCard(_t(s['payout_card_cup']))),
+                    if (_t(s['payout_card_mlc']).isNotEmpty) ...[
+                      const SizedBox(height: 6),
+                      CopyRow(label: 'Tarjeta MLC del vendedor', value: onlyDigits(_t(s['payout_card_mlc'])), display: formatCard(_t(s['payout_card_mlc']))),
+                    ],
+                    if (_t(s['payout_wallet']).isNotEmpty) ...[
+                      const SizedBox(height: 6),
+                      CopyRow(label: 'Wallet del vendedor', value: _t(s['payout_wallet'])),
+                    ],
+                    if (_t(s['phone']).isNotEmpty) ...[
+                      const SizedBox(height: 6),
+                      TextButton.icon(
+                        onPressed: () => openUrl('https://wa.me/${onlyDigits(_t(s['phone']))}'),
+                        icon: const Icon(Icons.chat_rounded, size: 18),
+                        label: const Text('Escribir por WhatsApp'),
+                      ),
+                    ],
+                    const SizedBox(height: 6),
+                    FilledButton.icon(
+                      onPressed: () => _payout(context, store, s),
+                      icon: const Icon(Icons.payments_rounded, size: 18),
+                      label: const Text('Registrar pago al vendedor'),
+                    ),
+                    const SizedBox(height: 8),
+                    Row(
+                      children: [
+                        Expanded(
+                          child: OutlinedButton(
+                            onPressed: () => _setCommission(context, store, s),
+                            child: const Text('Comisión'),
+                          ),
+                        ),
+                        const SizedBox(width: 10),
+                        Expanded(
+                          child: OutlinedButton(
+                            style: OutlinedButton.styleFrom(
+                                foregroundColor: _t(s['seller_status']) == 'suspended' ? Palette.ok : Palette.danger),
+                            onPressed: () => _run(
+                              context,
+                              () => store.suspendSeller(_t(s['user_id']), _t(s['seller_status']) != 'suspended'),
+                              ok: _t(s['seller_status']) == 'suspended' ? 'Vendedor reactivado' : 'Vendedor suspendido',
+                            ),
+                            child: Text(_t(s['seller_status']) == 'suspended' ? 'Reactivar' : 'Suspender'),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ],
+                ),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+}
+DLJ_EOF_8
+cat > 'lib/screens/order_success_page.dart' <<'DLJ_EOF_9'
 import 'package:flutter/material.dart';
 
 import '../models/models.dart';
@@ -2143,8 +3558,8 @@ class OrderSuccessPage extends StatelessWidget {
     );
   }
 }
-DLJ_EOF_8
-cat > 'lib/screens/payment_crypto_page.dart' <<'DLJ_EOF_9'
+DLJ_EOF_9
+cat > 'lib/screens/payment_crypto_page.dart' <<'DLJ_EOF_10'
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:qr_flutter/qr_flutter.dart';
@@ -2445,8 +3860,8 @@ class _WalletBox extends StatelessWidget {
     );
   }
 }
-DLJ_EOF_9
-cat > 'lib/screens/payment_transfermovil_page.dart' <<'DLJ_EOF_10'
+DLJ_EOF_10
+cat > 'lib/screens/payment_transfermovil_page.dart' <<'DLJ_EOF_11'
 import 'package:flutter/material.dart';
 
 import '../data/api.dart';
@@ -2718,8 +4133,8 @@ class _Step extends StatelessWidget {
     );
   }
 }
-DLJ_EOF_10
-cat > 'lib/screens/product_page.dart' <<'DLJ_EOF_11'
+DLJ_EOF_11
+cat > 'lib/screens/product_page.dart' <<'DLJ_EOF_12'
 import 'package:flutter/material.dart';
 
 import '../models/models.dart';
@@ -2790,6 +4205,18 @@ class ProductPage extends StatelessWidget {
                     Text(p.name,
                         style: const TextStyle(
                             fontSize: 28, fontWeight: FontWeight.w900, height: 1.1, letterSpacing: -0.6)),
+                    if (p.sellerName.isNotEmpty) ...[
+                      const SizedBox(height: 8),
+                      Row(
+                        children: [
+                          const Icon(Icons.storefront_rounded, size: 16, color: Palette.muted),
+                          const SizedBox(width: 6),
+                          Text('Vendido por ${p.sellerName}',
+                              style: const TextStyle(
+                                  color: Palette.muted, fontSize: 13.5, fontWeight: FontWeight.w700)),
+                        ],
+                      ),
+                    ],
                     if (p.subtitle.isNotEmpty) ...[
                       const SizedBox(height: 6),
                       Text(p.subtitle,
@@ -2918,8 +4345,8 @@ class _InfoTile extends StatelessWidget {
     );
   }
 }
-DLJ_EOF_11
-cat > 'lib/screens/purchases_page.dart' <<'DLJ_EOF_12'
+DLJ_EOF_12
+cat > 'lib/screens/purchases_page.dart' <<'DLJ_EOF_13'
 import 'package:flutter/material.dart';
 
 import '../models/models.dart';
@@ -3165,8 +4592,8 @@ class _Downloads extends StatelessWidget {
     );
   }
 }
-DLJ_EOF_12
-cat > 'lib/screens/seller_pages.dart' <<'DLJ_EOF_13'
+DLJ_EOF_13
+cat > 'lib/screens/seller_pages.dart' <<'DLJ_EOF_14'
 import 'dart:async';
 import 'dart:io';
 
@@ -3179,130 +4606,22 @@ import '../state/app_store.dart';
 import '../theme/app_theme.dart';
 import '../utils/helpers.dart';
 import '../widgets/common.dart';
+import 'marketplace_pages.dart';
 
 // ───────────────────────── Acceso con PIN ─────────────────────────
 
 class SellerGate extends StatelessWidget {
-  const SellerGate({super.key, this.adminEntry = false});
-  final bool adminEntry;
+  const SellerGate({super.key});
 
   @override
   Widget build(BuildContext context) {
     final store = AppScope.of(context);
     if (store.remote) {
-      if (!store.api.isAdmin) return _LoginScreen(adminEntry: adminEntry);
-      return const MarketplaceDashboard();
+      if (!store.api.isLoggedIn) return const AuthScreen();
+      return store.role == 'admin' ? const SellerDashboard() : const SellerAreaPage();
     }
     if (store.sellerUnlocked) return const SellerDashboard();
     return _PinScreen(creating: !store.hasPin);
-  }
-}
-
-/// Entrada del vendedor cuando la tienda usa servidor: correo y contraseña.
-class _LoginScreen extends StatefulWidget {
-  const _LoginScreen({this.adminEntry = false});
-  final bool adminEntry;
-  @override
-  State<_LoginScreen> createState() => _LoginScreenState();
-}
-
-class _LoginScreenState extends State<_LoginScreen> {
-  final email = TextEditingController();
-  final pass = TextEditingController();
-  String? error;
-  bool busy = false;
-  bool hide = true;
-
-  @override
-  void dispose() {
-    email.dispose();
-    pass.dispose();
-    super.dispose();
-  }
-
-  Future<void> _login(AppStore store) async {
-    if (email.text.trim().isEmpty || pass.text.isEmpty) {
-      setState(() => error = 'Escribe tu correo y tu contraseña');
-      return;
-    }
-    setState(() {
-      busy = true;
-      error = null;
-    });
-    try {
-      await store.sellerLogin(email.text, pass.text);
-    } on ApiException catch (e) {
-      if (mounted) setState(() => error = e.message);
-    }
-    if (mounted) setState(() => busy = false);
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final store = AppScope.of(context);
-    return Scaffold(
-      appBar: AppBar(title: Text(widget.adminEntry ? 'Administración' : 'Panel del vendedor')),
-      body: ListView(
-        padding: const EdgeInsets.fromLTRB(24, 20, 24, 30),
-        children: [
-          const Center(child: BrandLogo(size: 84)),
-          const SizedBox(height: 22),
-          Text(widget.adminEntry ? 'Acceso administrador' : 'Acceso de vendedor',
-              textAlign: TextAlign.center,
-              style: const TextStyle(fontSize: 22, fontWeight: FontWeight.w800)),
-          const SizedBox(height: 6),
-          Text(
-              widget.adminEntry
-                  ? 'Entra con el correo de administrador (el que está en la tabla admins de Supabase).'
-                  : 'Entra con la cuenta de vendedor que creaste en el servidor.',
-              textAlign: TextAlign.center, style: const TextStyle(color: Palette.muted, height: 1.4)),
-          const SizedBox(height: 26),
-          TextField(
-            controller: email,
-            keyboardType: TextInputType.emailAddress,
-            autocorrect: false,
-            decoration: fieldDec('Correo', icon: Icons.alternate_email_rounded),
-          ),
-          const SizedBox(height: 12),
-          TextField(
-            controller: pass,
-            obscureText: hide,
-            decoration: fieldDec('Contraseña', icon: Icons.lock_outline_rounded).copyWith(
-              suffixIcon: IconButton(
-                icon: Icon(hide ? Icons.visibility_rounded : Icons.visibility_off_rounded),
-                onPressed: () => setState(() => hide = !hide),
-              ),
-            ),
-            onSubmitted: (_) => _login(store),
-          ),
-          if (error != null) ...[
-            const SizedBox(height: 10),
-            Text(error!,
-                textAlign: TextAlign.center,
-                style: const TextStyle(color: Palette.danger, fontWeight: FontWeight.w700)),
-          ],
-          const SizedBox(height: 22),
-          CoralButton(
-            label: busy ? 'Entrando…' : 'Entrar',
-            icon: Icons.lock_open_rounded,
-            onPressed: busy ? null : () => _login(store),
-          ),
-          const SizedBox(height: 10),
-          TextButton(onPressed: busy ? null : () async {
-            final n=TextEditingController(), e=TextEditingController(), p=TextEditingController();
-            final ok=await showDialog<bool>(context:context,builder:(ctx)=>AlertDialog(
-              title:const Text('Crear cuenta de vendedor'),
-              content:SingleChildScrollView(child:Column(mainAxisSize:MainAxisSize.min,children:[
-                TextField(controller:n,decoration:const InputDecoration(labelText:'Nombre')),
-                TextField(controller:e,keyboardType:TextInputType.emailAddress,decoration:const InputDecoration(labelText:'Correo')),
-                TextField(controller:p,obscureText:true,decoration:const InputDecoration(labelText:'Contraseña')),
-              ])), actions:[TextButton(onPressed:()=>Navigator.pop(ctx,false),child:const Text('Cancelar')),
-              FilledButton(onPressed:()=>Navigator.pop(ctx,true),child:const Text('Registrarme'))]));
-            if(ok==true){try{await store.registerMarketplaceAccount(e.text,p.text,n.text);if(context.mounted)ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content:Text('Cuenta creada. Si Supabase solicita confirmar el correo, confirma el mensaje y luego inicia sesión.')));}catch(err){if(context.mounted)ScaffoldMessenger.of(context).showSnackBar(SnackBar(content:Text('$err')));}}
-          }, child:const Text('Crear cuenta para vender')),
-        ],
-      ),
-    );
   }
 }
 
@@ -3418,77 +4737,6 @@ class _PinScreenState extends State<_PinScreen> {
 
 // ───────────────────────── Panel ─────────────────────────
 
-class MarketplaceDashboard extends StatefulWidget {
-  const MarketplaceDashboard({super.key});
-  @override State<MarketplaceDashboard> createState() => _MarketplaceDashboardState();
-}
-
-class _MarketplaceDashboardState extends State<MarketplaceDashboard> {
-  bool busy = false;
-  Future<void> reload(AppStore s) async { setState(()=>busy=true); await s.refreshSeller(); if(mounted)setState(()=>busy=false); }
-  Future<void> requestSeller(AppStore s) async {
-    final name=TextEditingController(), phone=TextEditingController(), desc=TextEditingController();
-    final ok=await showDialog<bool>(context:context,builder:(ctx)=>AlertDialog(
-      title: const Text('Solicitar cuenta de vendedor'),
-      content: SingleChildScrollView(child: Column(mainAxisSize:MainAxisSize.min,children:[
-        TextField(controller:name,decoration:const InputDecoration(labelText:'Nombre del negocio')),
-        TextField(controller:phone,decoration:const InputDecoration(labelText:'Teléfono de contacto')),
-        TextField(controller:desc,maxLines:3,decoration:const InputDecoration(labelText:'Descripción')),
-      ])), actions:[TextButton(onPressed:()=>Navigator.pop(ctx,false),child:const Text('Cancelar')),
-      FilledButton(onPressed:()=>Navigator.pop(ctx,true),child:const Text('Enviar solicitud'))]));
-    if(ok==true){try{await s.requestSeller(name.text,desc.text,phone.text);if(mounted)ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content:Text('Solicitud enviada. Espera la aprobación del administrador.')));}catch(e){if(mounted)ScaffoldMessenger.of(context).showSnackBar(SnackBar(content:Text('$e')));}}
-  }
-  Future<void> addProduct(AppStore s) async {
-    final name=TextEditingController(), subtitle=TextEditingController(), desc=TextEditingController(), cup=TextEditingController(), mlc=TextEditingController(), usdt=TextEditingController(), image=TextEditingController(), download=TextEditingController();
-    ProductKind kind=ProductKind.app; bool digital=true;
-    final ok=await showDialog<bool>(context:context,builder:(ctx)=>StatefulBuilder(builder:(ctx,setD)=>AlertDialog(
-      title:const Text('Publicar producto'), content:SizedBox(width:420,child:SingleChildScrollView(child:Column(mainAxisSize:MainAxisSize.min,children:[
-        TextField(controller:name,decoration:const InputDecoration(labelText:'Nombre *')),
-        TextField(controller:subtitle,decoration:const InputDecoration(labelText:'Subtítulo')),
-        TextField(controller:desc,maxLines:3,decoration:const InputDecoration(labelText:'Descripción')),
-        DropdownButtonFormField<ProductKind>(value:kind,decoration:const InputDecoration(labelText:'Categoría'),items:ProductKind.values.map((v)=>DropdownMenuItem(value:v,child:Text(v.name))).toList(),onChanged:(v)=>setD(()=>kind=v??kind)),
-        TextField(controller:cup,keyboardType:TextInputType.number,decoration:const InputDecoration(labelText:'Precio CUP')),
-        TextField(controller:mlc,keyboardType:TextInputType.number,decoration:const InputDecoration(labelText:'Precio MLC')),
-        TextField(controller:usdt,keyboardType:TextInputType.number,decoration:const InputDecoration(labelText:'Precio USDT')),
-        TextField(controller:image,decoration:const InputDecoration(labelText:'URL de imagen (opcional)')),
-        SwitchListTile(value:digital,onChanged:(v)=>setD(()=>digital=v),title:const Text('Producto digital / APK')),
-        if(digital)TextField(controller:download,decoration:const InputDecoration(labelText:'URL de descarga (provisional)')),
-        const Text('La publicación quedará pendiente hasta que el administrador la apruebe.',style:TextStyle(fontSize:12)),
-      ]))), actions:[TextButton(onPressed:()=>Navigator.pop(ctx,false),child:const Text('Cancelar')),FilledButton(onPressed:()=>Navigator.pop(ctx,true),child:const Text('Enviar a revisión'))])));
-    if(ok==true){try{await s.sellerSaveProduct(Product(id:'',name:name.text.trim(),subtitle:subtitle.text,description:desc.text,kind:kind,priceCUP:double.tryParse(cup.text)??0,priceMLC:double.tryParse(mlc.text)??0,priceUSDT:double.tryParse(usdt.text)??0,imageUrl:image.text,downloadUrl:download.text,isDigital:digital));if(mounted)ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content:Text('Producto enviado a revisión.')));}catch(e){if(mounted)ScaffoldMessenger.of(context).showSnackBar(SnackBar(content:Text('$e')));}}
-  }
-  @override Widget build(BuildContext context){final s=AppScope.of(context); final admin=s.marketplaceRole=='admin';
-    return Scaffold(appBar:AppBar(title:Text(admin?'Administración Marketplace':'Mi panel de vendedor'),actions:[IconButton(onPressed:()=>reload(s),icon:const Icon(Icons.refresh)),IconButton(onPressed:(){s.sellerLogout();},icon:const Icon(Icons.logout))]),
-    body:RefreshIndicator(onRefresh:()=>reload(s),child:ListView(padding:const EdgeInsets.all(16),children:[
-      if(admin)...[
-        Text('Solicitudes de vendedores',style:Theme.of(context).textTheme.titleLarge),
-        if(s.marketplaceApplications.isEmpty)const ListTile(title:Text('No hay solicitudes pendientes')),
-        for(final a in s.marketplaceApplications.where((x)=>x['status']=='pending')) Card(child:ListTile(title:Text('${a['business_name']??'Negocio'}'),subtitle:Text('${a['email']??''}\n${a['description']??''}'),isThreeLine:true,trailing:Wrap(children:[IconButton(onPressed:()=>s.reviewSeller('${a['id']}','approved'),icon:const Icon(Icons.check_circle,color:Colors.green)),IconButton(onPressed:()=>s.reviewSeller('${a['id']}','rejected'),icon:const Icon(Icons.cancel,color:Colors.red))]))),
-        const SizedBox(height:18),Text('Publicaciones pendientes',style:Theme.of(context).textTheme.titleLarge),
-        for(final p in s.marketplaceProducts.where((x)=>x['seller_id']!=null && x['publication_status']=='pending')) Card(child:ListTile(
-          title:Text('${p['name']??'Producto'}'), subtitle:Text('Vendedor: ${p['seller_id']} · CUP ${p['price_cup']??0}'),
-          trailing:Wrap(children:[IconButton(onPressed:()=>s.reviewMarketplaceProduct('${p['id']}','approved'),icon:const Icon(Icons.check_circle,color:Colors.green)),
-          IconButton(onPressed:()=>s.reviewMarketplaceProduct('${p['id']}','rejected'),icon:const Icon(Icons.cancel,color:Colors.red))]))),
-        if(s.marketplaceProducts.where((x)=>x['seller_id']!=null && x['publication_status']=='pending').isEmpty) const Text('No hay publicaciones pendientes.'),
-        const SizedBox(height:18),FilledButton.tonal(onPressed:()=>Navigator.push(context,MaterialPageRoute(builder:(_)=>const SellerDashboard())),child:const Text('Abrir administración clásica')),
-      ] else if(s.sellerStatus=='none'||s.sellerStatus=='rejected')...[
-        const Icon(Icons.storefront,size:58),const Text('Conviértete en vendedor',textAlign:TextAlign.center),
-        FilledButton(onPressed:()=>requestSeller(s),child:const Text('Solicitar aprobación')),
-      ] else if(s.sellerStatus=='pending')...[
-        const Icon(Icons.hourglass_top,size:58),const Text('Tu solicitud está pendiente de aprobación.',textAlign:TextAlign.center),
-      ] else if(s.sellerStatus=='suspended')...[
-        const Text('Tu cuenta de vendedor está suspendida. Contacta con administración.'),
-      ] else ...[
-        Text('Mis publicaciones',style:Theme.of(context).textTheme.titleLarge),
-        FilledButton.icon(onPressed:()=>addProduct(s),icon:const Icon(Icons.add),label:const Text('Publicar producto o APK')),
-        for(final p in s.mySellerProducts) Card(child:ListTile(title:Text(p.name),subtitle:Text('CUP ${p.priceCUP.toStringAsFixed(0)} · ${p.active?'Activo':'En revisión'}'),trailing:IconButton(icon:const Icon(Icons.delete_outline),onPressed:()=>s.sellerDeleteProduct(p.id)))),
-        const SizedBox(height:18),Text('Mis ventas',style:Theme.of(context).textTheme.titleLarge),
-        for(final sale in s.marketplaceSales) Card(child:ListTile(title:Text('Pedido ${sale['code']??sale['order_id']??''}'),subtitle:Text('Cliente: ${sale['customer_name']??''} · Estado: ${sale['status']??''}'))),
-      ]
-    ])));
-  }
-}
-
 class SellerDashboard extends StatefulWidget {
   const SellerDashboard({super.key});
   @override
@@ -3521,7 +4769,7 @@ class _SellerDashboardState extends State<SellerDashboard> {
   Widget build(BuildContext context) {
     final store = AppScope.of(context);
     return DefaultTabController(
-      length: 3,
+      length: store.remote ? 4 : 3,
       child: Scaffold(
         appBar: AppBar(
           title: const Text('Panel del vendedor'),
@@ -3559,15 +4807,27 @@ class _SellerDashboardState extends State<SellerDashboard> {
                 ],
               ),
             ),
-            const TabBar(
+            TabBar(
+              isScrollable: store.remote,
+              tabAlignment: store.remote ? TabAlignment.start : null,
               labelColor: Palette.navy,
               unselectedLabelColor: Palette.muted,
               indicatorColor: Palette.coral,
-              labelStyle: TextStyle(fontWeight: FontWeight.w800),
-              tabs: [Tab(text: 'Pedidos'), Tab(text: 'Catálogo'), Tab(text: 'Ajustes')],
+              labelStyle: const TextStyle(fontWeight: FontWeight.w800),
+              tabs: [
+                const Tab(text: 'Pedidos'),
+                const Tab(text: 'Catálogo'),
+                const Tab(text: 'Ajustes'),
+                if (store.remote) const Tab(text: 'Marketplace'),
+              ],
             ),
-            const Expanded(
-              child: TabBarView(children: [_OrdersTab(), _CatalogTab(), _SettingsTab()]),
+            Expanded(
+              child: TabBarView(children: [
+                const _OrdersTab(),
+                const _CatalogTab(),
+                const _SettingsTab(),
+                if (store.remote) const AdminMarketTab(),
+              ]),
             ),
           ],
         ),
@@ -4590,8 +5850,8 @@ class _SettingsTabState extends State<_SettingsTab> {
     );
   }
 }
-DLJ_EOF_13
-cat > 'lib/screens/shell.dart' <<'DLJ_EOF_14'
+DLJ_EOF_14
+cat > 'lib/screens/shell.dart' <<'DLJ_EOF_15'
 import 'package:flutter/material.dart';
 
 import '../state/app_store.dart';
@@ -4682,8 +5942,8 @@ class _MainShellState extends State<MainShell> {
     );
   }
 }
-DLJ_EOF_14
-cat > 'lib/screens/wallet_page.dart' <<'DLJ_EOF_15'
+DLJ_EOF_15
+cat > 'lib/screens/wallet_page.dart' <<'DLJ_EOF_16'
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
@@ -4822,8 +6082,8 @@ class _WalletPageState extends State<WalletPage> {
     );
   }
 }
-DLJ_EOF_15
-cat > 'lib/state/app_store.dart' <<'DLJ_EOF_16'
+DLJ_EOF_16
+cat > 'lib/state/app_store.dart' <<'DLJ_EOF_17'
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
@@ -4939,14 +6199,18 @@ class AppStore extends ChangeNotifier {
   String? syncError;
   List<OrderRecord> sellerOrders = [];
   List<Product> adminProducts = [];
+
+  // Marketplace: cuenta, vendedor y administración
+  String role = ''; // 'admin' | 'user' (vacío = sin sesión)
+  String sellerStatus = 'none'; // none | pending | approved | rejected | suspended
+  Map<String, dynamic> sellerProfile = {};
+  double marketCommission = 10;
   List<Product> mySellerProducts = [];
-  List<Map<String,dynamic>> marketplaceApplications = [];
-  List<Map<String,dynamic>> marketplaceProducts = [];
-  List<Map<String,dynamic>> marketplaceSales = [];
-  String marketplaceRole = '';
-  String sellerStatus = 'none';
+  List<Map<String, dynamic>> sellerSales = [];
+  Map<String, dynamic> sellerBalanceData = {};
+  List<Map<String, dynamic>> adminApplicationList = [];
+  Map<String, dynamic> adminOverviewData = {};
   bool _sellerVisible = !kRemote;
-  bool _adminVisible = false;
   // Foto elegida cuando Android cerró la app mientras estaba abierta la galería.
   String pendingImage = '';
   // Aviso para el cliente cuando el vendedor verifica o rechaza su pedido.
@@ -4965,7 +6229,6 @@ class AppStore extends ChangeNotifier {
   static const _kOrders = 'djl2_orders';
   static const _kCurrency = 'djl2_currency';
   static const _kSellerVisible = 'djl2_seller_visible';
-  static const _kAdminVisible = 'djl2_admin_visible';
 
   // ─────────── Carga / guardado ───────────
 
@@ -4993,10 +6256,7 @@ class AppStore extends ChangeNotifier {
       }
       final cur = p.getString(_kCurrency);
       currency = Cur.values.firstWhere((e) => e.name == cur, orElse: () => Cur.cup);
-      if (remote) {
-        _sellerVisible = p.getBool(_kSellerVisible) ?? false;
-        _adminVisible = p.getBool(_kAdminVisible) ?? false;
-      }
+      if (remote) _sellerVisible = p.getBool(_kSellerVisible) ?? false;
     } catch (_) {
       // Si algún dato guardado está dañado, arrancamos con el catálogo base.
       if (products.isEmpty && !remote) products = seedProducts();
@@ -5105,63 +6365,85 @@ class AppStore extends ChangeNotifier {
     }
   }
 
+  /// Inicia sesión con correo y contraseña y carga el rol (administrador o usuario).
   Future<void> sellerLogin(String email, String password) async {
     await api.login(email, password);
     try {
-      try {
-        sellerOrders = await api.adminOrders();
-        adminProducts = await api.adminProducts();
-        marketplaceRole = 'admin';
-        marketplaceApplications = await api.adminSellerApplications();
-        marketplaceProducts = await api.adminMarketplaceProducts();
-        await markAdminEntryVisible();
-      } on ApiException {
-        final status = await api.mySellerStatus();
-        sellerStatus = (status['seller_status'] ?? 'none').toString();
-        marketplaceRole = 'seller';
-        if (sellerStatus == 'approved') {
-          mySellerProducts = await api.sellerProducts();
-          marketplaceSales = await api.sellerSales();
-        }
-      }
-    } on ApiException catch (e) {
+      await _loadRole();
+    } on ApiException {
       api.logout();
-      marketplaceRole = '';
-      throw ApiException(e.message);
+      rethrow;
     }
     notifyListeners();
   }
 
-  Future<void> registerMarketplaceAccount(String email, String password, String name) =>
-      api.signUp(email, password, name);
+  /// Crea una cuenta nueva. Devuelve true si ya quedó con la sesión iniciada.
+  Future<bool> accountSignUp(String email, String password, String name) async {
+    final logged = await api.signUp(email, password, name);
+    if (logged) {
+      try {
+        await _loadRole();
+      } on ApiException {
+        api.logout();
+        rethrow;
+      }
+      notifyListeners();
+    }
+    return logged;
+  }
 
-  Future<void> requestSeller(String business, String description, String phone) async {
-    await api.applyAsSeller(business, description, phone);
-    final status = await api.mySellerStatus();
-    sellerStatus = (status['seller_status'] ?? 'pending').toString();
-    notifyListeners();
+  Future<void> _loadRole() async {
+    final r = await api.myRole();
+    role = (r['role'] ?? 'user').toString();
+    try {
+      marketCommission = await api.marketplaceCommission();
+    } catch (_) {}
+    if (role == 'admin') {
+      sellerStatus = 'approved';
+      sellerOrders = await api.adminOrders();
+      adminProducts = await api.adminProducts();
+      adminApplicationList = await api.adminApplications();
+      adminOverviewData = await api.adminOverview();
+    } else {
+      sellerStatus = (r['seller_status'] ?? 'none').toString();
+      sellerProfile = Map<String, dynamic>.from(r);
+      if (sellerStatus == 'approved') {
+        mySellerProducts = await api.sellerProducts();
+        sellerSales = await api.sellerSales();
+        sellerBalanceData = await api.sellerBalance();
+      } else {
+        mySellerProducts = [];
+        sellerSales = [];
+        sellerBalanceData = {};
+      }
+    }
   }
 
   Future<void> refreshSeller() async {
-    if (!remote || !api.isAdmin && marketplaceRole != 'seller') return;
+    if (!remote || !api.isLoggedIn) return;
     try {
-      if (marketplaceRole == 'admin') {
-        sellerOrders = await api.adminOrders();
-        adminProducts = await api.adminProducts();
-        marketplaceApplications = await api.adminSellerApplications();
-        marketplaceProducts = await api.adminMarketplaceProducts();
-      } else if (sellerStatus == 'approved') {
-        mySellerProducts = await api.sellerProducts();
-        marketplaceSales = await api.sellerSales();
-      }
-    } on ApiException catch (e) { syncError = e.message; }
+      await _loadRole();
+    } on ApiException catch (e) {
+      syncError = e.message;
+    }
     notifyListeners();
+  }
+
+  // ----- Vendedor -----
+
+  Future<void> applyAsSeller(String business, String description, String phone) async {
+    await api.applyAsSeller(business, description, phone);
+    await refreshSeller();
+  }
+
+  Future<void> saveSellerProfile(Map<String, dynamic> data) async {
+    await api.updateSellerProfile(data);
+    await refreshSeller();
   }
 
   Future<void> sellerSaveProduct(Product p) async {
     await api.sellerSaveProduct(p);
     await refreshSeller();
-    await refreshRemote();
   }
 
   Future<void> sellerDeleteProduct(String id) async {
@@ -5169,25 +6451,40 @@ class AppStore extends ChangeNotifier {
     await refreshSeller();
   }
 
-  Future<void> reviewSeller(String id, String decision) async {
-    await api.adminReviewSeller(id, decision);
-    await refreshSeller();
-  }
+  // ----- Administración del marketplace -----
 
-  Future<void> reviewMarketplaceProduct(String id, String decision) async {
-    await api.adminReviewProduct(id, decision);
+  Future<void> reviewSeller(String applicationId, String decision, String note) async {
+    await api.adminReviewSeller(applicationId, decision, note);
     await refreshSeller();
     await refreshRemote();
   }
 
-  Future<void> setMarketplaceCommission(double rate) async {
-    await api.adminSetCommission(rate);
+  Future<void> suspendSeller(String userId, bool suspend) async {
+    await api.adminSuspendSeller(userId, suspend);
+    await refreshSeller();
+    await refreshRemote();
   }
 
-  void sellerLogout() {
-    api.logout(); marketplaceRole = ''; sellerStatus = 'none';
-    mySellerProducts = []; marketplaceSales = []; marketplaceApplications = [];
-    notifyListeners();
+  Future<void> reviewProduct(String productId, String decision, String note) async {
+    await api.adminReviewProduct(productId, decision, note);
+    await refreshSeller();
+    await refreshRemote();
+  }
+
+  Future<void> setDefaultCommission(double rate) async {
+    await api.adminSetCommission(rate);
+    await refreshSeller();
+  }
+
+  Future<void> setSellerCommission(String userId, double rate) async {
+    await api.adminSetSellerCommission(userId, rate);
+    await refreshSeller();
+  }
+
+  Future<void> recordPayout(
+      String sellerId, String currency, double amount, String reference, String note) async {
+    await api.adminRecordPayout(sellerId, currency, amount, reference, note);
+    await refreshSeller();
   }
 
   Future<void> adminSaveProduct(Product p) async {
@@ -5210,27 +6507,6 @@ class AppStore extends ChangeNotifier {
 
   // Entrada discreta al panel del vendedor (7 toques en «Información»).
   bool get sellerEntryVisible => _sellerVisible;
-  bool get adminEntryVisible => _adminVisible || api.isAdmin;
-
-  /// Solo el dueño: 7 toques en «HANDMADE D.L.J STORE» en Ajustes.
-  Future<bool> revealAdminEntry() async {
-    if (_adminVisible) return false;
-    _aboutTaps++;
-    if (_aboutTaps < 7) return false;
-    _adminVisible = true;
-    final p = await SharedPreferences.getInstance();
-    await p.setBool(_kAdminVisible, true);
-    notifyListeners();
-    return true;
-  }
-
-  Future<void> markAdminEntryVisible() async {
-    if (_adminVisible) return;
-    _adminVisible = true;
-    final p = await SharedPreferences.getInstance();
-    await p.setBool(_kAdminVisible, true);
-    notifyListeners();
-  }
 
   Future<bool> aboutTap() async {
     if (_sellerVisible) return false;
@@ -5473,6 +6749,14 @@ class AppStore extends ChangeNotifier {
       api.logout();
       sellerOrders = [];
       adminProducts = [];
+      role = '';
+      sellerStatus = 'none';
+      sellerProfile = {};
+      mySellerProducts = [];
+      sellerSales = [];
+      sellerBalanceData = {};
+      adminApplicationList = [];
+      adminOverviewData = {};
     }
     sellerUnlocked = false;
     notifyListeners();
@@ -5489,8 +6773,8 @@ class AppScope extends InheritedNotifier<AppStore> {
     return scope!.notifier!;
   }
 }
-DLJ_EOF_16
-cat > 'lib/theme/app_theme.dart' <<'DLJ_EOF_17'
+DLJ_EOF_17
+cat > 'lib/theme/app_theme.dart' <<'DLJ_EOF_18'
 import 'package:flutter/material.dart';
 
 /// Paleta tomada del logo de HANDMADE D.L.J STORE: azul marino profundo,
@@ -5628,8 +6912,8 @@ ThemeData buildTheme() {
     dividerColor: Palette.line,
   );
 }
-DLJ_EOF_17
-cat > 'lib/utils/helpers.dart' <<'DLJ_EOF_18'
+DLJ_EOF_18
+cat > 'lib/utils/helpers.dart' <<'DLJ_EOF_19'
 import 'dart:math';
 
 import 'package:crypto/crypto.dart';
@@ -5823,8 +7107,8 @@ Future<bool> openUrl(String url) async {
     return false;
   }
 }
-DLJ_EOF_18
-cat > 'lib/widgets/common.dart' <<'DLJ_EOF_19'
+DLJ_EOF_19
+cat > 'lib/widgets/common.dart' <<'DLJ_EOF_20'
 import 'dart:io';
 
 import 'package:flutter/material.dart';
@@ -6220,12 +7504,12 @@ InputDecoration fieldDec(String label, {String? hint, IconData? icon}) => InputD
       hintText: hint,
       prefixIcon: icon == null ? null : Icon(icon, size: 20),
     );
-DLJ_EOF_19
-cat > 'pubspec.yaml' <<'DLJ_EOF_20'
+DLJ_EOF_20
+cat > 'pubspec.yaml' <<'DLJ_EOF_21'
 name: tienda_cuba
 description: HANDMADE D.L.J STORE - Tienda de apps, juegos, arte, pintura, escultura y artesanías con pagos Transfermóvil CUP/MLC y crypto TRC20
 publish_to: 'none'
-version: 2.2.0+4
+version: 3.0.0+5
 
 environment:
   sdk: '>=3.2.0 <4.0.0'
@@ -6252,14 +7536,14 @@ flutter:
   uses-material-design: true
   assets:
     - assets/images/logo.png
-DLJ_EOF_20
-cat > 'analysis_options.yaml' <<'DLJ_EOF_21'
+DLJ_EOF_21
+cat > 'analysis_options.yaml' <<'DLJ_EOF_22'
 include: package:flutter_lints/flutter.yaml
 linter:
   rules:
     prefer_const_constructors: false
     avoid_print: false
-DLJ_EOF_21
+DLJ_EOF_22
 base64 -d > assets/images/logo.png <<'DLJ_B64'
 iVBORw0KGgoAAAANSUhEUgAAAgAAAAIACAYAAAD0eNT6AAEAAElEQVR4nNT9eaAtSVEnjn8iq865
 973XKzTduIwrgigugwt+AYURATdQwQUFBBEUF0ARRwcZFgERUUEYFdn3RRAEhG42QWZGRwV1VHRA
