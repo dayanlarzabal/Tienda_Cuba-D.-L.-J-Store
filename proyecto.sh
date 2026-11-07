@@ -294,7 +294,73 @@ class Api {
     return price;
   }
 
-  // ─────────── Vendedor ───────────
+  // ─────────── Marketplace multi-vendedor ───────────
+
+  Future<void> signUp(String email, String password, String name) async {
+    final r = await _guard(() => _c.post(
+      Uri.parse('$kSupabaseUrl/auth/v1/signup'),
+      headers: {'apikey': kSupabaseAnonKey, 'Content-Type': 'application/json'},
+      body: jsonEncode({'email': email.trim(), 'password': password,
+        'data': {'name': name.trim()}}),
+    ));
+    if (r.statusCode < 200 || r.statusCode >= 300) throw ApiException(_errorMessage(r));
+  }
+
+  Future<Map<String, dynamic>> mySellerStatus() async =>
+      Map<String, dynamic>.from(await _rpc('dlj_my_seller_status') as Map);
+
+  Future<void> applyAsSeller(String business, String description, String phone) async {
+    await _rpc('dlj_apply_as_seller', {'p_business_name': business,
+      'p_description': description, 'p_phone': phone});
+  }
+
+  Future<List<Product>> sellerProducts() async {
+    final j = await _rpc('dlj_seller_products');
+    final rows = j is List ? j : <dynamic>[];
+    return rows.map((e) => productFromRow(Map<String,dynamic>.from(e as Map))).toList();
+  }
+
+  Future<void> sellerSaveProduct(Product p) async {
+    await _rpc('dlj_seller_save_product', {'p': {
+      'id': RegExp(r'^[0-9a-fA-F-]{36}$').hasMatch(p.id) ? p.id : null,
+      'name': p.name, 'subtitle': p.subtitle, 'description': p.description,
+      'kind': p.kind.name, 'price_cup': p.priceCUP, 'price_mlc': p.priceMLC,
+      'price_usdt': p.priceUSDT, 'image_url': p.imageUrl,
+      'download_url': p.downloadUrl, 'is_digital': p.isDigital,
+      'badge': p.badge,
+    }});
+  }
+
+  Future<void> sellerDeleteProduct(String id) =>
+      _rpc('dlj_seller_delete_product', {'p_id': id});
+
+  Future<List<Map<String,dynamic>>> sellerSales() async {
+    final j = await _rpc('dlj_seller_orders');
+    return (j as List).map((e) => Map<String,dynamic>.from(e as Map)).toList();
+  }
+
+  Future<List<Map<String,dynamic>>> adminSellerApplications() async {
+    final j = await _rpc('dlj_admin_seller_applications');
+    return (j as List).map((e) => Map<String,dynamic>.from(e as Map)).toList();
+  }
+
+  Future<List<Map<String,dynamic>>> adminMarketplaceProducts() async {
+    final j = await _rpc('admin_list_products');
+    return (j as List).map((e) => Map<String,dynamic>.from(e as Map)).toList();
+  }
+
+  Future<void> adminReviewSeller(String id, String decision, [String note = '']) =>
+      _rpc('dlj_admin_review_seller', {'p_application_id': id,
+        'p_decision': decision, 'p_note': note});
+
+  Future<void> adminReviewProduct(String id, String decision, [String note = '']) =>
+      _rpc('dlj_admin_review_product', {'p_product_id': id,
+        'p_decision': decision, 'p_note': note});
+
+  Future<void> adminSetCommission(double rate) =>
+      _rpc('dlj_admin_set_commission', {'p_rate': rate});
+
+  // ─────────── Administración clásica ───────────
 
   Future<List<OrderRecord>> adminOrders() async {
     final j = await _rpc('admin_orders');
@@ -3114,7 +3180,8 @@ class SellerGate extends StatelessWidget {
   Widget build(BuildContext context) {
     final store = AppScope.of(context);
     if (store.remote) {
-      return store.api.isAdmin ? const SellerDashboard() : const _LoginScreen();
+      if (!store.api.isAdmin) return const _LoginScreen();
+      return const MarketplaceDashboard();
     }
     if (store.sellerUnlocked) return const SellerDashboard();
     return _PinScreen(creating: !store.hasPin);
@@ -3206,6 +3273,19 @@ class _LoginScreenState extends State<_LoginScreen> {
             icon: Icons.lock_open_rounded,
             onPressed: busy ? null : () => _login(store),
           ),
+          const SizedBox(height: 10),
+          TextButton(onPressed: busy ? null : () async {
+            final n=TextEditingController(), e=TextEditingController(), p=TextEditingController();
+            final ok=await showDialog<bool>(context:context,builder:(ctx)=>AlertDialog(
+              title:const Text('Crear cuenta de vendedor'),
+              content:SingleChildScrollView(child:Column(mainAxisSize:MainAxisSize.min,children:[
+                TextField(controller:n,decoration:const InputDecoration(labelText:'Nombre')),
+                TextField(controller:e,keyboardType:TextInputType.emailAddress,decoration:const InputDecoration(labelText:'Correo')),
+                TextField(controller:p,obscureText:true,decoration:const InputDecoration(labelText:'Contraseña')),
+              ])), actions:[TextButton(onPressed:()=>Navigator.pop(ctx,false),child:const Text('Cancelar')),
+              FilledButton(onPressed:()=>Navigator.pop(ctx,true),child:const Text('Registrarme'))]));
+            if(ok==true){try{await store.registerMarketplaceAccount(e.text,p.text,n.text);if(context.mounted)ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content:Text('Cuenta creada. Si Supabase solicita confirmar el correo, confirma el mensaje y luego inicia sesión.')));}catch(err){if(context.mounted)ScaffoldMessenger.of(context).showSnackBar(SnackBar(content:Text('$err')));}}
+          }, child:const Text('Crear cuenta para vender')),
         ],
       ),
     );
@@ -3323,6 +3403,77 @@ class _PinScreenState extends State<_PinScreen> {
 }
 
 // ───────────────────────── Panel ─────────────────────────
+
+class MarketplaceDashboard extends StatefulWidget {
+  const MarketplaceDashboard({super.key});
+  @override State<MarketplaceDashboard> createState() => _MarketplaceDashboardState();
+}
+
+class _MarketplaceDashboardState extends State<MarketplaceDashboard> {
+  bool busy = false;
+  Future<void> reload(AppStore s) async { setState(()=>busy=true); await s.refreshSeller(); if(mounted)setState(()=>busy=false); }
+  Future<void> requestSeller(AppStore s) async {
+    final name=TextEditingController(), phone=TextEditingController(), desc=TextEditingController();
+    final ok=await showDialog<bool>(context:context,builder:(ctx)=>AlertDialog(
+      title: const Text('Solicitar cuenta de vendedor'),
+      content: SingleChildScrollView(child: Column(mainAxisSize:MainAxisSize.min,children:[
+        TextField(controller:name,decoration:const InputDecoration(labelText:'Nombre del negocio')),
+        TextField(controller:phone,decoration:const InputDecoration(labelText:'Teléfono de contacto')),
+        TextField(controller:desc,maxLines:3,decoration:const InputDecoration(labelText:'Descripción')),
+      ])), actions:[TextButton(onPressed:()=>Navigator.pop(ctx,false),child:const Text('Cancelar')),
+      FilledButton(onPressed:()=>Navigator.pop(ctx,true),child:const Text('Enviar solicitud'))]));
+    if(ok==true){try{await s.requestSeller(name.text,desc.text,phone.text);if(mounted)ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content:Text('Solicitud enviada. Espera la aprobación del administrador.')));}catch(e){if(mounted)ScaffoldMessenger.of(context).showSnackBar(SnackBar(content:Text('$e')));}}
+  }
+  Future<void> addProduct(AppStore s) async {
+    final name=TextEditingController(), subtitle=TextEditingController(), desc=TextEditingController(), cup=TextEditingController(), mlc=TextEditingController(), usdt=TextEditingController(), image=TextEditingController(), download=TextEditingController();
+    ProductKind kind=ProductKind.app; bool digital=true;
+    final ok=await showDialog<bool>(context:context,builder:(ctx)=>StatefulBuilder(builder:(ctx,setD)=>AlertDialog(
+      title:const Text('Publicar producto'), content:SizedBox(width:420,child:SingleChildScrollView(child:Column(mainAxisSize:MainAxisSize.min,children:[
+        TextField(controller:name,decoration:const InputDecoration(labelText:'Nombre *')),
+        TextField(controller:subtitle,decoration:const InputDecoration(labelText:'Subtítulo')),
+        TextField(controller:desc,maxLines:3,decoration:const InputDecoration(labelText:'Descripción')),
+        DropdownButtonFormField<ProductKind>(value:kind,decoration:const InputDecoration(labelText:'Categoría'),items:ProductKind.values.map((v)=>DropdownMenuItem(value:v,child:Text(v.name))).toList(),onChanged:(v)=>setD(()=>kind=v??kind)),
+        TextField(controller:cup,keyboardType:TextInputType.number,decoration:const InputDecoration(labelText:'Precio CUP')),
+        TextField(controller:mlc,keyboardType:TextInputType.number,decoration:const InputDecoration(labelText:'Precio MLC')),
+        TextField(controller:usdt,keyboardType:TextInputType.number,decoration:const InputDecoration(labelText:'Precio USDT')),
+        TextField(controller:image,decoration:const InputDecoration(labelText:'URL de imagen (opcional)')),
+        SwitchListTile(value:digital,onChanged:(v)=>setD(()=>digital=v),title:const Text('Producto digital / APK')),
+        if(digital)TextField(controller:download,decoration:const InputDecoration(labelText:'URL de descarga (provisional)')),
+        const Text('La publicación quedará pendiente hasta que el administrador la apruebe.',style:TextStyle(fontSize:12)),
+      ]))), actions:[TextButton(onPressed:()=>Navigator.pop(ctx,false),child:const Text('Cancelar')),FilledButton(onPressed:()=>Navigator.pop(ctx,true),child:const Text('Enviar a revisión'))])));
+    if(ok==true){try{await s.sellerSaveProduct(Product(id:'',name:name.text.trim(),subtitle:subtitle.text,description:desc.text,kind:kind,priceCUP:double.tryParse(cup.text)??0,priceMLC:double.tryParse(mlc.text)??0,priceUSDT:double.tryParse(usdt.text)??0,imageUrl:image.text,downloadUrl:download.text,isDigital:digital));if(mounted)ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content:Text('Producto enviado a revisión.')));}catch(e){if(mounted)ScaffoldMessenger.of(context).showSnackBar(SnackBar(content:Text('$e')));}}
+  }
+  @override Widget build(BuildContext context){final s=AppScope.of(context); final admin=s.marketplaceRole=='admin';
+    return Scaffold(appBar:AppBar(title:Text(admin?'Administración Marketplace':'Mi panel de vendedor'),actions:[IconButton(onPressed:()=>reload(s),icon:const Icon(Icons.refresh)),IconButton(onPressed:(){s.sellerLogout();},icon:const Icon(Icons.logout))]),
+    body:RefreshIndicator(onRefresh:()=>reload(s),child:ListView(padding:const EdgeInsets.all(16),children:[
+      if(admin)...[
+        Text('Solicitudes de vendedores',style:Theme.of(context).textTheme.titleLarge),
+        if(s.marketplaceApplications.isEmpty)const ListTile(title:Text('No hay solicitudes pendientes')),
+        for(final a in s.marketplaceApplications.where((x)=>x['status']=='pending')) Card(child:ListTile(title:Text('${a['business_name']??'Negocio'}'),subtitle:Text('${a['email']??''}\n${a['description']??''}'),isThreeLine:true,trailing:Wrap(children:[IconButton(onPressed:()=>s.reviewSeller('${a['id']}','approved'),icon:const Icon(Icons.check_circle,color:Colors.green)),IconButton(onPressed:()=>s.reviewSeller('${a['id']}','rejected'),icon:const Icon(Icons.cancel,color:Colors.red))]))),
+        const SizedBox(height:18),Text('Publicaciones pendientes',style:Theme.of(context).textTheme.titleLarge),
+        for(final p in s.marketplaceProducts.where((x)=>x['seller_id']!=null && x['publication_status']=='pending')) Card(child:ListTile(
+          title:Text('${p['name']??'Producto'}'), subtitle:Text('Vendedor: ${p['seller_id']} · CUP ${p['price_cup']??0}'),
+          trailing:Wrap(children:[IconButton(onPressed:()=>s.reviewMarketplaceProduct('${p['id']}','approved'),icon:const Icon(Icons.check_circle,color:Colors.green)),
+          IconButton(onPressed:()=>s.reviewMarketplaceProduct('${p['id']}','rejected'),icon:const Icon(Icons.cancel,color:Colors.red))]))),
+        if(s.marketplaceProducts.where((x)=>x['seller_id']!=null && x['publication_status']=='pending').isEmpty) const Text('No hay publicaciones pendientes.'),
+        const SizedBox(height:18),FilledButton.tonal(onPressed:()=>Navigator.push(context,MaterialPageRoute(builder:(_)=>const SellerDashboard())),child:const Text('Abrir administración clásica')),
+      ] else if(s.sellerStatus=='none'||s.sellerStatus=='rejected')...[
+        const Icon(Icons.storefront,size:58),const Text('Conviértete en vendedor',textAlign:TextAlign.center),
+        FilledButton(onPressed:()=>requestSeller(s),child:const Text('Solicitar aprobación')),
+      ] else if(s.sellerStatus=='pending')...[
+        const Icon(Icons.hourglass_top,size:58),const Text('Tu solicitud está pendiente de aprobación.',textAlign:TextAlign.center),
+      ] else if(s.sellerStatus=='suspended')...[
+        const Text('Tu cuenta de vendedor está suspendida. Contacta con administración.'),
+      ] else ...[
+        Text('Mis publicaciones',style:Theme.of(context).textTheme.titleLarge),
+        FilledButton.icon(onPressed:()=>addProduct(s),icon:const Icon(Icons.add),label:const Text('Publicar producto o APK')),
+        for(final p in s.mySellerProducts) Card(child:ListTile(title:Text(p.name),subtitle:Text('CUP ${p.priceCUP.toStringAsFixed(0)} · ${p.active?'Activo':'En revisión'}'),trailing:IconButton(icon:const Icon(Icons.delete_outline),onPressed:()=>s.sellerDeleteProduct(p.id)))),
+        const SizedBox(height:18),Text('Mis ventas',style:Theme.of(context).textTheme.titleLarge),
+        for(final sale in s.marketplaceSales) Card(child:ListTile(title:Text('Pedido ${sale['code']??sale['order_id']??''}'),subtitle:Text('Cliente: ${sale['customer_name']??''} · Estado: ${sale['status']??''}'))),
+      ]
+    ])));
+  }
+}
 
 class SellerDashboard extends StatefulWidget {
   const SellerDashboard({super.key});
@@ -4774,6 +4925,12 @@ class AppStore extends ChangeNotifier {
   String? syncError;
   List<OrderRecord> sellerOrders = [];
   List<Product> adminProducts = [];
+  List<Product> mySellerProducts = [];
+  List<Map<String,dynamic>> marketplaceApplications = [];
+  List<Map<String,dynamic>> marketplaceProducts = [];
+  List<Map<String,dynamic>> marketplaceSales = [];
+  String marketplaceRole = '';
+  String sellerStatus = 'none';
   bool _sellerVisible = !kRemote;
   // Foto elegida cuando Android cerró la app mientras estaba abierta la galería.
   String pendingImage = '';
@@ -4932,24 +5089,84 @@ class AppStore extends ChangeNotifier {
   Future<void> sellerLogin(String email, String password) async {
     await api.login(email, password);
     try {
-      sellerOrders = await api.adminOrders();
-      adminProducts = await api.adminProducts();
+      try {
+        sellerOrders = await api.adminOrders();
+        adminProducts = await api.adminProducts();
+        marketplaceRole = 'admin';
+        marketplaceApplications = await api.adminSellerApplications();
+        marketplaceProducts = await api.adminMarketplaceProducts();
+      } on ApiException {
+        final status = await api.mySellerStatus();
+        sellerStatus = (status['seller_status'] ?? 'none').toString();
+        marketplaceRole = 'seller';
+        if (sellerStatus == 'approved') {
+          mySellerProducts = await api.sellerProducts();
+          marketplaceSales = await api.sellerSales();
+        }
+      }
     } on ApiException catch (e) {
       api.logout();
-      throw ApiException(
-          e.message == 'No autorizado' ? 'Esta cuenta no es de vendedor' : e.message);
+      marketplaceRole = '';
+      throw ApiException(e.message);
     }
     notifyListeners();
   }
 
+  Future<void> registerMarketplaceAccount(String email, String password, String name) =>
+      api.signUp(email, password, name);
+
+  Future<void> requestSeller(String business, String description, String phone) async {
+    await api.applyAsSeller(business, description, phone);
+    final status = await api.mySellerStatus();
+    sellerStatus = (status['seller_status'] ?? 'pending').toString();
+    notifyListeners();
+  }
+
   Future<void> refreshSeller() async {
-    if (!remote || !api.isAdmin) return;
+    if (!remote || !api.isAdmin && marketplaceRole != 'seller') return;
     try {
-      sellerOrders = await api.adminOrders();
-      adminProducts = await api.adminProducts();
-    } on ApiException catch (e) {
-      syncError = e.message;
-    }
+      if (marketplaceRole == 'admin') {
+        sellerOrders = await api.adminOrders();
+        adminProducts = await api.adminProducts();
+        marketplaceApplications = await api.adminSellerApplications();
+        marketplaceProducts = await api.adminMarketplaceProducts();
+      } else if (sellerStatus == 'approved') {
+        mySellerProducts = await api.sellerProducts();
+        marketplaceSales = await api.sellerSales();
+      }
+    } on ApiException catch (e) { syncError = e.message; }
+    notifyListeners();
+  }
+
+  Future<void> sellerSaveProduct(Product p) async {
+    await api.sellerSaveProduct(p);
+    await refreshSeller();
+    await refreshRemote();
+  }
+
+  Future<void> sellerDeleteProduct(String id) async {
+    await api.sellerDeleteProduct(id);
+    await refreshSeller();
+  }
+
+  Future<void> reviewSeller(String id, String decision) async {
+    await api.adminReviewSeller(id, decision);
+    await refreshSeller();
+  }
+
+  Future<void> reviewMarketplaceProduct(String id, String decision) async {
+    await api.adminReviewProduct(id, decision);
+    await refreshSeller();
+    await refreshRemote();
+  }
+
+  Future<void> setMarketplaceCommission(double rate) async {
+    await api.adminSetCommission(rate);
+  }
+
+  void sellerLogout() {
+    api.logout(); marketplaceRole = ''; sellerStatus = 'none';
+    mySellerProducts = []; marketplaceSales = []; marketplaceApplications = [];
     notifyListeners();
   }
 
