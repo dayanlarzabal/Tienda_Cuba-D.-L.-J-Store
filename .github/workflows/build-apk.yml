@@ -1,16 +1,15 @@
-name: Compilar APK
+name: Build Android APK
 
 on:
   push:
     branches: [main]
   workflow_dispatch:
 
-permissions:
-  contents: read
-
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -18,28 +17,42 @@ jobs:
       - name: Configurar Java
         uses: actions/setup-java@v4
         with:
-          distribution: temurin
-          java-version: "17"
+          distribution: 'temurin'
+          java-version: '17'
 
       - name: Configurar Flutter
         uses: subosito/flutter-action@v2
         with:
-          flutter-version: "3.24.5"
-          channel: stable
+          flutter-version: '3.24.5'
+          channel: 'stable'
           cache: true
 
-      - name: Generar proyecto y compilar
+      - name: Generar proyecto
         env:
           SUPABASE_URL: ${{ vars.SUPABASE_URL }}
           SUPABASE_ANON_KEY: ${{ vars.SUPABASE_ANON_KEY }}
+        run: bash proyecto.sh
+
+      - name: Dependencias
+        run: flutter pub get
+
+      - name: Analizar código
         run: |
-          bash proyecto.sh
-          flutter pub get
-          flutter build apk --release
+          flutter analyze --no-fatal-infos --no-fatal-warnings > analyze.txt 2>&1 || true
+          grep -E "^\s*error " analyze.txt | head -10 | while IFS= read -r l; do echo "::error::$l"; done || true
+          { echo '### Errores de código'; grep -E "^\s*error " analyze.txt | head -40 || echo 'Sin errores'; } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Compilar APK
+        run: |
+          set -o pipefail
+          flutter build apk --release 2>&1 | tee build.log || {
+            grep -E "Error:|error:|What went wrong" -A4 build.log | head -10 | while IFS= read -r l; do echo "::error::$l"; done
+            exit 1
+          }
 
       - name: Subir APK
         uses: actions/upload-artifact@v4
         with:
           name: dlj-store-apk
           path: build/app/outputs/flutter-apk/app-release.apk
-          if-no-files-found: error
+          retention-days: 30
