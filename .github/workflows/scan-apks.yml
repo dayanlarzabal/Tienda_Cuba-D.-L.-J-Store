@@ -1,0 +1,26 @@
+name: Escanear APK de vendedores
+
+on:
+  schedule:
+    - cron: '*/30 * * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: scan-apks
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Escanear
+        env:
+          SUPABASE_URL: ${{ vars.SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ vars.SUPABASE_ANON_KEY }}
+          SCANNER_TOKEN: ${{ secrets.SCANNER_TOKEN }}
+          VT_API_KEY: ${{ secrets.VT_API_KEY }}
+        run: python3 scan_apks.py
